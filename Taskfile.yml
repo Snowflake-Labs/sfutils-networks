@@ -1,0 +1,128 @@
+version: "3"
+
+dotenv: [".env"]
+
+vars:
+  PYTHON: uv run --project {{.TASKFILE_DIR}}
+  CLI: "{{.PYTHON}} snow-utils-networks"
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list-all
+
+  setup:
+    desc: Install dependencies
+    cmds:
+      - uv venv
+      - uv sync
+
+  create:
+    desc: Create a network rule with optional policy
+    cmds:
+      - "{{.CLI}} rule create {{.CLI_ARGS}}"
+    env:
+      NW_RULE_NAME: "{{.NW_RULE_NAME}}"
+      NW_RULE_DB: "{{.NW_RULE_DB}}"
+      NW_RULE_SCHEMA: "{{.NW_RULE_SCHEMA}}"
+    vars:
+      NW_RULE_NAME: '{{.NW_RULE_NAME | default ""}}'
+      NW_RULE_DB: '{{.NW_RULE_DB | default ""}}'
+      NW_RULE_SCHEMA: '{{.NW_RULE_SCHEMA | default "NETWORKS"}}'
+
+  github:
+    desc: Create network rule for GitHub Actions IPs
+    cmds:
+      - "{{.CLI}} rule create --allow-gh {{.CLI_ARGS}}"
+    env:
+      NW_RULE_NAME: "{{.NW_RULE_NAME}}"
+      NW_RULE_DB: "{{.NW_RULE_DB}}"
+      NW_RULE_SCHEMA: "{{.NW_RULE_SCHEMA}}"
+    vars:
+      NW_RULE_NAME: '{{.NW_RULE_NAME | default ""}}'
+      NW_RULE_DB: '{{.NW_RULE_DB | default ""}}'
+      NW_RULE_SCHEMA: '{{.NW_RULE_SCHEMA | default "NETWORKS"}}'
+
+  google:
+    desc: Create network rule for Google IPs
+    cmds:
+      - "{{.CLI}} rule create --allow-google {{.CLI_ARGS}}"
+    env:
+      NW_RULE_NAME: "{{.NW_RULE_NAME}}"
+      NW_RULE_DB: "{{.NW_RULE_DB}}"
+      NW_RULE_SCHEMA: "{{.NW_RULE_SCHEMA}}"
+    vars:
+      NW_RULE_NAME: '{{.NW_RULE_NAME | default ""}}'
+      NW_RULE_DB: '{{.NW_RULE_DB | default ""}}'
+      NW_RULE_SCHEMA: '{{.NW_RULE_SCHEMA | default "NETWORKS"}}'
+
+  local:
+    desc: Create network rule for current IP only
+    cmds:
+      - "{{.CLI}} rule create --no-gh --no-google {{.CLI_ARGS}}"
+    env:
+      NW_RULE_NAME: "{{.NW_RULE_NAME}}"
+      NW_RULE_DB: "{{.NW_RULE_DB}}"
+      NW_RULE_SCHEMA: "{{.NW_RULE_SCHEMA}}"
+    vars:
+      NW_RULE_NAME: '{{.NW_RULE_NAME | default ""}}'
+      NW_RULE_DB: '{{.NW_RULE_DB | default ""}}'
+      NW_RULE_SCHEMA: '{{.NW_RULE_SCHEMA | default "NETWORKS"}}'
+
+  policy:
+    desc: Create or alter a network policy
+    cmds:
+      - "{{.CLI}} policy create {{.CLI_ARGS}}"
+
+  list-rules:
+    desc: List network rules in a schema
+    cmds:
+      - "{{.CLI}} rule list {{.CLI_ARGS}}"
+    env:
+      NW_RULE_DB: "{{.NW_RULE_DB}}"
+      NW_RULE_SCHEMA: "{{.NW_RULE_SCHEMA}}"
+    vars:
+      NW_RULE_DB: '{{.NW_RULE_DB | default ""}}'
+      NW_RULE_SCHEMA: '{{.NW_RULE_SCHEMA | default "NETWORKS"}}'
+
+  list-policies:
+    desc: List all network policies
+    cmds:
+      - "{{.CLI}} policy list"
+
+  update-rule:
+    desc: Update (replace) values in an existing network rule
+    cmds:
+      - "{{.CLI}} rule update {{.CLI_ARGS}}"
+    env:
+      NW_RULE_NAME: "{{.NW_RULE_NAME}}"
+      NW_RULE_DB: "{{.NW_RULE_DB}}"
+      NW_RULE_SCHEMA: "{{.NW_RULE_SCHEMA}}"
+    vars:
+      NW_RULE_NAME: '{{.NW_RULE_NAME | default ""}}'
+      NW_RULE_DB: '{{.NW_RULE_DB | default ""}}'
+      NW_RULE_SCHEMA: '{{.NW_RULE_SCHEMA | default "NETWORKS"}}'
+
+  delete-rule:
+    desc: Delete a network rule
+    cmds:
+      - "{{.CLI}} rule delete --yes {{.CLI_ARGS}}"
+    env:
+      NW_RULE_NAME: "{{.NW_RULE_NAME}}"
+      NW_RULE_DB: "{{.NW_RULE_DB}}"
+      NW_RULE_SCHEMA: "{{.NW_RULE_SCHEMA}}"
+    vars:
+      NW_RULE_NAME: '{{.NW_RULE_NAME | default ""}}'
+      NW_RULE_DB: '{{.NW_RULE_DB | default ""}}'
+      NW_RULE_SCHEMA: '{{.NW_RULE_SCHEMA | default "NETWORKS"}}'
+
+  delete-policy:
+    desc: Delete a network policy
+    cmds:
+      - "{{.CLI}} policy delete --yes {{.CLI_ARGS}}"
+
+  help:
+    desc: Show network CLI options
+    cmds:
+      - "{{.CLI}} --help"
