@@ -1,8 +1,8 @@
 """
-Vendored snow CLI utilities for snow-utils-networks.
+Vendored snow CLI utilities for sfutils-networks.
 
 Thin wrappers around the `snow` CLI for executing SQL.
-Copied from snow-utils-common so this package has zero external dependencies
+Originally aligned with shared sfutils patterns; this package is self-contained
 beyond click/requests. Feel free to customize for network-specific needs.
 """
 

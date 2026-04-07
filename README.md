@@ -1,4 +1,4 @@
-# snow-utils-networks
+# sfutils-networks
 
 Create and manage Snowflake network rules and policies from the terminal. Supports IPv4 presets for GitHub Actions, Google services, and local IP detection.
 
@@ -20,19 +20,19 @@ uv sync          # or: pip install .
 
 ```bash
 # Create a network rule with your local IP (default)
-snow-utils-networks rule create --name dev_rule --db my_db
+sfutils-networks rule create --name dev_rule --db my_db
 
 # Include GitHub Actions runner IPs for CI/CD
-snow-utils-networks rule create --name ci_rule --db my_db --allow-gh
+sfutils-networks rule create --name ci_rule --db my_db --allow-gh
 
 # Create rule + network policy in one command
-snow-utils-networks rule create --name ci_rule --db my_db --allow-gh --policy ci_policy
+sfutils-networks rule create --name ci_rule --db my_db --allow-gh --policy ci_policy
 
 # Google IPs (App Scripts, Cloud Functions, etc.)
-snow-utils-networks rule create --name google_rule --db my_db --allow-google
+sfutils-networks rule create --name google_rule --db my_db --allow-google
 
 # Egress rule for external APIs
-snow-utils-networks rule create --name api_egress --db my_db \
+sfutils-networks rule create --name api_egress --db my_db \
     --mode egress --type host_port \
     --values "api.openai.com:443,api.anthropic.com:443"
 ```
@@ -93,6 +93,10 @@ task delete-policy -- --name old_policy
 | `NW_RULE_NAME` | Network rule name |
 | `NW_RULE_DB` | Database for network rules |
 | `NW_RULE_SCHEMA` | Schema for network rules (default: `NETWORKS`) |
+
+## Related
+
+- [sf-utils-skills](https://github.com/Snowflake-Labs/sf-utils-skills) — Cortex Code skill `sf-utils-networks` (after repo rename from `snow-utils-skills`)
 
 ## License
 

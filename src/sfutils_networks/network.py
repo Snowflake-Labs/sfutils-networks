@@ -26,14 +26,14 @@ import re
 
 import click
 from dotenv import load_dotenv
-from snow_utils_networks._presets import (
+from sfutils_networks._presets import (
     NetworkRuleMode,
     NetworkRuleType,
     collect_ipv4_cidrs,
     get_valid_types_for_mode,
     validate_mode_type,
 )
-from snow_utils_networks._snow import (
+from sfutils_networks._snow import (
     run_snow_sql,
     run_snow_sql_stdin,
     set_snow_cli_options,
@@ -87,7 +87,7 @@ def get_network_rule_sql(
         CREATE OR REPLACE NETWORK RULE SQL statement (idempotent)
     """
     value_list = ", ".join(f"'{v}'" for v in values)
-    comment_text = comment or "Created by snow-utils"
+    comment_text = comment or "Created by sfutils"
     return f"""CREATE OR REPLACE NETWORK RULE {db}.{schema}.{name}
     MODE = {mode.value}
     TYPE = {rule_type.value}
@@ -113,7 +113,7 @@ def get_network_policy_sql(
         CREATE NETWORK POLICY IF NOT EXISTS SQL statement (idempotent)
     """
     rule_list = ", ".join(rule_refs)
-    comment_text = comment or "Created by snow-utils"
+    comment_text = comment or "Created by sfutils"
     return f"""CREATE NETWORK POLICY IF NOT EXISTS {policy_name}
     ALLOWED_NETWORK_RULE_LIST = ({rule_list})
     COMMENT = '{comment_text}';"""
@@ -455,14 +455,14 @@ def get_setup_network_for_user_sql(
         values=cidrs,
         mode=NetworkRuleMode.INGRESS,
         rule_type=NetworkRuleType.IPV4,
-        comment=f"Used by {user_part} - {project_part} app - managed by snow-utils-networks",
+        comment=f"Used by {user_part} - {project_part} app - managed by sfutils-networks",
         force=force,
     )
 
     policy_sql = get_network_policy_sql(
         policy_name=policy_name,
         rule_refs=[rule_fqn],
-        comment=f"Used by {user_part} - {project_part} app - managed by snow-utils-networks",
+        comment=f"Used by {user_part} - {project_part} app - managed by sfutils-networks",
         force=force,
     )
 
@@ -508,7 +508,7 @@ def setup_network_for_user(
         values=cidrs,
         mode=NetworkRuleMode.INGRESS,
         rule_type=NetworkRuleType.IPV4,
-        comment=f"{ctx} network rule - managed by snow-utils-pat",
+        comment=f"{ctx} network rule - managed by sfutils-networks",
         dry_run=dry_run,
         force=force,
         admin_role=admin_role,
@@ -517,7 +517,7 @@ def setup_network_for_user(
     create_network_policy(
         policy_name=policy_name,
         rule_refs=[rule_fqn],
-        comment=f"{ctx} network policy - managed by snow-utils-pat",
+        comment=f"{ctx} network policy - managed by sfutils-networks",
         dry_run=dry_run,
         force=force,
         admin_role=admin_role,

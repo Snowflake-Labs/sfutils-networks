@@ -4,7 +4,7 @@ dotenv: [".env"]
 
 vars:
   PYTHON: uv run --project {{.TASKFILE_DIR}}
-  CLI: "{{.PYTHON}} snow-utils-networks"
+  CLI: "{{.PYTHON}} sfutils-networks"
 
 tasks:
   default:

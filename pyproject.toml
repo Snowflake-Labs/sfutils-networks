@@ -1,7 +1,7 @@
 [project]
-name = "snow-utils-networks"
+name = "sfutils-networks"
 version = "0.1.0"
-description = "Snowflake network rules and policies manager - a snow-utils plugin"
+description = "Snowflake network rules and policies manager - sfutils CLI package"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -12,15 +12,15 @@ dependencies = [
 ]
 
 [project.scripts]
-snow-utils-networks = "snow_utils_networks:cli"
-check-setup = "snow_utils_networks.check_setup:check"
+sfutils-networks = "sfutils_networks:cli"
+check-setup = "sfutils_networks.check_setup:check"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/snow_utils_networks"]
+packages = ["src/sfutils_networks"]
 
 [tool.ruff]
 line-length = 100
