@@ -45,6 +45,17 @@ def _sql_str(value: str) -> str:
     return value.replace("'", "''")
 
 
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def _assert_safe_identifier(value: str, label: str = "identifier") -> None:
+    """Raise ClickException if value is not a safe unquoted SQL identifier."""
+    if not _IDENT_RE.match(value):
+        raise click.ClickException(
+            f"Invalid {label} '{value}': must match ^[A-Za-z_][A-Za-z0-9_$]*$"
+        )
+
+
 def normalize_identifier(name: str, style: str = "snowflake") -> str:
     """Normalize name for SQL or DNS compliance.
 
@@ -91,6 +102,9 @@ def get_network_rule_sql(
     Returns:
         CREATE OR REPLACE NETWORK RULE SQL statement (idempotent)
     """
+    _assert_safe_identifier(name, "name")
+    _assert_safe_identifier(db, "db")
+    _assert_safe_identifier(schema, "schema")
     value_list = ", ".join(f"'{_sql_str(v)}'" for v in values)
     comment_text = comment or "Created by sfutils"
     return f"""CREATE OR REPLACE NETWORK RULE {db}.{schema}.{name}
@@ -117,6 +131,7 @@ def get_network_policy_sql(
     Returns:
         CREATE NETWORK POLICY IF NOT EXISTS SQL statement (idempotent)
     """
+    _assert_safe_identifier(policy_name, "policy_name")
     rule_list = ", ".join(rule_refs)
     comment_text = comment or "Created by sfutils"
     return f"""CREATE NETWORK POLICY IF NOT EXISTS {policy_name}
@@ -138,6 +153,7 @@ def get_alter_network_policy_sql(
     Returns:
         ALTER NETWORK POLICY SQL statement
     """
+    _assert_safe_identifier(policy_name, "policy_name")
     rule_list = ", ".join(rule_refs)
     return f"""ALTER NETWORK POLICY {policy_name}
     ADD ALLOWED_NETWORK_RULE_LIST = ({rule_list});"""
@@ -349,11 +365,17 @@ def update_network_for_user(
 
 def delete_network_rule(name: str, db: str, schema: str, admin_role: str = "accountadmin") -> None:
     """Delete a network rule (idempotent)."""
+    _assert_safe_identifier(name, "name")
+    _assert_safe_identifier(db, "db")
+    _assert_safe_identifier(schema, "schema")
+    _assert_safe_identifier(admin_role, "admin_role")
     run_snow_sql_stdin(f"USE ROLE {admin_role};\nDROP NETWORK RULE IF EXISTS {db}.{schema}.{name}")
 
 
 def delete_network_policy(policy_name: str, admin_role: str = "accountadmin") -> None:
     """Delete a network policy (idempotent)."""
+    _assert_safe_identifier(policy_name, "policy_name")
+    _assert_safe_identifier(admin_role, "admin_role")
     run_snow_sql_stdin(f"USE ROLE {admin_role};\nDROP NETWORK POLICY IF EXISTS {policy_name}")
 
 
@@ -409,6 +431,8 @@ def get_policies_for_rule(
 
 def detach_rule_from_policy(policy_name: str, admin_role: str = "accountadmin") -> None:
     """Temporarily detach all rules from a policy (SET to empty list)."""
+    _assert_safe_identifier(policy_name, "policy_name")
+    _assert_safe_identifier(admin_role, "admin_role")
     sql = f"USE ROLE {admin_role};\nALTER NETWORK POLICY IF EXISTS {policy_name} SET ALLOWED_NETWORK_RULE_LIST = ();"
     run_snow_sql_stdin(sql)
 
@@ -417,6 +441,8 @@ def reattach_rule_to_policy(
     policy_name: str, rule_fqn: str, admin_role: str = "accountadmin"
 ) -> None:
     """Re-attach a rule to a policy."""
+    _assert_safe_identifier(policy_name, "policy_name")
+    _assert_safe_identifier(admin_role, "admin_role")
     sql = f"USE ROLE {admin_role};\nALTER NETWORK POLICY IF EXISTS {policy_name} SET ALLOWED_NETWORK_RULE_LIST = ('{_sql_str(rule_fqn)}');"
     run_snow_sql_stdin(sql)
 
@@ -565,6 +591,9 @@ def assign_network_policy_to_user(
     user: str, policy_name: str, admin_role: str = "accountadmin"
 ) -> None:
     """Assign a network policy to a user."""
+    _assert_safe_identifier(user, "user")
+    _assert_safe_identifier(policy_name, "policy_name")
+    _assert_safe_identifier(admin_role, "admin_role")
     run_snow_sql_stdin(
         f"USE ROLE {admin_role};\nALTER USER {user} SET NETWORK_POLICY = '{_sql_str(policy_name)}';"
     )
