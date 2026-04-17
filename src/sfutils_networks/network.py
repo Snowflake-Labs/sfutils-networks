@@ -40,6 +40,11 @@ from sfutils_networks._snow import (
 )
 
 
+def _sql_str(value: str) -> str:
+    """Escape a value for safe use inside a SQL single-quoted literal."""
+    return value.replace("'", "''")
+
+
 def normalize_identifier(name: str, style: str = "snowflake") -> str:
     """Normalize name for SQL or DNS compliance.
 
@@ -86,13 +91,13 @@ def get_network_rule_sql(
     Returns:
         CREATE OR REPLACE NETWORK RULE SQL statement (idempotent)
     """
-    value_list = ", ".join(f"'{v}'" for v in values)
+    value_list = ", ".join(f"'{_sql_str(v)}'" for v in values)
     comment_text = comment or "Created by sfutils"
     return f"""CREATE OR REPLACE NETWORK RULE {db}.{schema}.{name}
     MODE = {mode.value}
     TYPE = {rule_type.value}
     VALUE_LIST = ({value_list})
-    COMMENT = '{comment_text}';"""
+    COMMENT = '{_sql_str(comment_text)}';"""
 
 
 def get_network_policy_sql(
@@ -116,7 +121,7 @@ def get_network_policy_sql(
     comment_text = comment or "Created by sfutils"
     return f"""CREATE NETWORK POLICY IF NOT EXISTS {policy_name}
     ALLOWED_NETWORK_RULE_LIST = ({rule_list})
-    COMMENT = '{comment_text}';"""
+    COMMENT = '{_sql_str(comment_text)}';"""
 
 
 def get_alter_network_policy_sql(
@@ -270,7 +275,7 @@ def get_update_network_rule_sql(
     Returns:
         ALTER NETWORK RULE SQL statement
     """
-    value_list = ", ".join(f"'{v}'" for v in values)
+    value_list = ", ".join(f"'{_sql_str(v)}'" for v in values)
     return f"ALTER NETWORK RULE {db}.{schema}.{name} SET VALUE_LIST = ({value_list});"
 
 
@@ -412,7 +417,7 @@ def reattach_rule_to_policy(
     policy_name: str, rule_fqn: str, admin_role: str = "accountadmin"
 ) -> None:
     """Re-attach a rule to a policy."""
-    sql = f"USE ROLE {admin_role};\nALTER NETWORK POLICY IF EXISTS {policy_name} SET ALLOWED_NETWORK_RULE_LIST = ('{rule_fqn}');"
+    sql = f"USE ROLE {admin_role};\nALTER NETWORK POLICY IF EXISTS {policy_name} SET ALLOWED_NETWORK_RULE_LIST = ('{_sql_str(rule_fqn)}');"
     run_snow_sql_stdin(sql)
 
 
@@ -561,7 +566,7 @@ def assign_network_policy_to_user(
 ) -> None:
     """Assign a network policy to a user."""
     run_snow_sql_stdin(
-        f"USE ROLE {admin_role};\nALTER USER {user} SET NETWORK_POLICY = '{policy_name}';"
+        f"USE ROLE {admin_role};\nALTER USER {user} SET NETWORK_POLICY = '{_sql_str(policy_name)}';"
     )
 
 
