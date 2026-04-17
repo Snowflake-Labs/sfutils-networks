@@ -122,6 +122,16 @@ tasks:
     cmds:
       - "{{.CLI}} policy delete --yes {{.CLI_ARGS}}"
 
+  unit:
+    desc: Run unit tests
+    cmds:
+      - uv run pytest tests -v
+
+  it-smoke:
+    desc: Run integration/smoke tests (requires live Snowflake connection)
+    cmds:
+      - bash scripts/it/smoke.sh
+
   help:
     desc: Show network CLI options
     cmds:
