@@ -386,12 +386,14 @@ def delete_network_policy(policy_name: str, admin_role: str = "accountadmin") ->
 
 def list_network_rules(db: str, schema: str, admin_role: str = "accountadmin") -> list[dict]:
     """List network rules in a schema."""
-    return run_snow_sql(f"SHOW NETWORK RULES IN SCHEMA {db}.{schema}", role=admin_role) or []
+    result = run_snow_sql(f"SHOW NETWORK RULES IN SCHEMA {db}.{schema}", role=admin_role)
+    return result if isinstance(result, list) else []
 
 
 def list_network_policies(admin_role: str = "accountadmin") -> list[dict]:
     """List all network policies."""
-    return run_snow_sql("SHOW NETWORK POLICIES", role=admin_role) or []
+    result = run_snow_sql("SHOW NETWORK POLICIES", role=admin_role)
+    return result if isinstance(result, list) else []
 
 
 def network_policy_exists(policy_name: str, admin_role: str = "accountadmin") -> bool:
