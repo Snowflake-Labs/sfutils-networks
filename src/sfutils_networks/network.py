@@ -192,6 +192,7 @@ def create_network_rule(
     Raises:
         click.ClickException: If mode/type combination is invalid
     """
+    _assert_safe_identifier(admin_role, "admin_role")
     if not validate_mode_type(mode, rule_type):
         valid = get_valid_types_for_mode(mode)
         raise click.ClickException(
@@ -245,6 +246,7 @@ def create_network_policy(
         dry_run: If True, only print SQL without executing
         admin_role: Role for creating resources (default: accountadmin)
     """
+    _assert_safe_identifier(admin_role, "admin_role")
     sql = get_network_policy_sql(policy_name, rule_refs, comment, force)
 
     if dry_run:
@@ -268,6 +270,7 @@ def alter_network_policy(
         dry_run: If True, only print SQL without executing
         admin_role: Role for modifying resources (default: accountadmin)
     """
+    _assert_safe_identifier(admin_role, "admin_role")
     sql = get_alter_network_policy_sql(policy_name, rule_refs)
 
     if dry_run:
@@ -296,6 +299,9 @@ def get_update_network_rule_sql(
     Returns:
         ALTER NETWORK RULE SQL statement
     """
+    _assert_safe_identifier(name, "name")
+    _assert_safe_identifier(db, "db")
+    _assert_safe_identifier(schema, "schema")
     value_list = ", ".join(f"'{_sql_str(v)}'" for v in values)
     return f"ALTER NETWORK RULE {db}.{schema}.{name} SET VALUE_LIST = ({value_list});"
 
@@ -322,6 +328,7 @@ def update_network_rule(
     Returns:
         Fully qualified network rule name (db.schema.name)
     """
+    _assert_safe_identifier(admin_role, "admin_role")
     sql = get_update_network_rule_sql(name, db, schema, values)
 
     if dry_run:
@@ -386,6 +393,8 @@ def delete_network_policy(policy_name: str, admin_role: str = "accountadmin") ->
 
 def list_network_rules(db: str, schema: str, admin_role: str = "accountadmin") -> list[dict]:
     """List network rules in a schema."""
+    _assert_safe_identifier(db, "db")
+    _assert_safe_identifier(schema, "schema")
     result = run_snow_sql(f"SHOW NETWORK RULES IN SCHEMA {db}.{schema}", role=admin_role)
     return result if isinstance(result, list) else []
 
@@ -402,6 +411,7 @@ def network_policy_exists(policy_name: str, admin_role: str = "accountadmin") ->
     Uses exact name lookup instead of listing all policies to avoid
     privilege errors on policies we don't own.
     """
+    _assert_safe_identifier(policy_name, "policy_name")
     try:
         result = run_snow_sql(f"DESC NETWORK POLICY {policy_name}", role=admin_role)
         return result is not None and len(result) > 0
@@ -422,6 +432,7 @@ def get_policies_for_rule(
     Returns:
         List containing expected_policy_name if it references the rule, empty otherwise.
     """
+    _assert_safe_identifier(expected_policy_name, "expected_policy_name")
     result = []
     try:
         desc = run_snow_sql(f"DESC NETWORK POLICY {expected_policy_name}", role=admin_role) or []
@@ -487,6 +498,7 @@ def get_setup_network_for_user_sql(
     Returns:
         Complete SQL string for rule and policy creation
     """
+    _assert_safe_identifier(admin_role, "admin_role")
     rule_name = f"{user}_NETWORK_RULE".upper()
     policy_name = f"{user}_NETWORK_POLICY".upper()
     rule_fqn = f"{db.upper()}.{schema.upper()}.{rule_name}"
@@ -588,6 +600,8 @@ def cleanup_network_for_user(
         unset_from_user: If True, also unset network policy from user
         admin_role: Role for dropping resources (default: accountadmin)
     """
+    _assert_safe_identifier(user, "user")
+    _assert_safe_identifier(admin_role, "admin_role")
     rule_name = f"{user}_NETWORK_RULE".upper()
     policy_name = f"{user}_NETWORK_POLICY".upper()
 
@@ -615,6 +629,8 @@ def assign_network_policy_to_user(
 
 def unassign_network_policy_from_user(user: str, admin_role: str = "accountadmin") -> None:
     """Remove network policy from a user (idempotent)."""
+    _assert_safe_identifier(user, "user")
+    _assert_safe_identifier(admin_role, "admin_role")
     run_snow_sql_stdin(
         f"USE ROLE {admin_role};\nALTER USER IF EXISTS {user} UNSET NETWORK_POLICY;", check=False
     )
