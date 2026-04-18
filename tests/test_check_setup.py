@@ -6,10 +6,7 @@ resolved_sa_admin_role, which are pure env-variable resolvers.
 
 from __future__ import annotations
 
-import pytest
-
-from sfutils_networks.check_setup import resolved_sf_utils_db, resolved_sa_admin_role
-
+from sfutils_networks.check_setup import resolved_sa_admin_role, resolved_sf_utils_db
 
 # ---------------------------------------------------------------------------
 # resolved_sf_utils_db

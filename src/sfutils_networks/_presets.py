@@ -9,7 +9,7 @@ Provides:
 """
 
 import ipaddress
-from enum import Enum
+from enum import StrEnum
 from functools import lru_cache
 
 import click
@@ -21,10 +21,10 @@ def _validate_cidr(cidr: str) -> str:
     try:
         return str(ipaddress.ip_network(cidr, strict=False))
     except ValueError as e:
-        raise click.ClickException(f"Invalid CIDR '{cidr}': {e}")
+        raise click.ClickException(f"Invalid CIDR '{cidr}': {e}") from e
 
 
-class NetworkRuleMode(str, Enum):
+class NetworkRuleMode(StrEnum):
     """Snowflake network rule modes."""
 
     INGRESS = "INGRESS"
@@ -34,7 +34,7 @@ class NetworkRuleMode(str, Enum):
     POSTGRES_EGRESS = "POSTGRES_EGRESS"
 
 
-class NetworkRuleType(str, Enum):
+class NetworkRuleType(StrEnum):
     """Snowflake network rule value types."""
 
     IPV4 = "IPV4"

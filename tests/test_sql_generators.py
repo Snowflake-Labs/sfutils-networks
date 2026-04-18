@@ -8,21 +8,20 @@ get_update_network_rule_sql, get_setup_network_for_user_sql.
 
 from __future__ import annotations
 
-import pytest
 import click
+import pytest
 
-from sfutils_networks.network import (
-    _sql_str,
-    _assert_safe_identifier,
-    normalize_identifier,
-    get_network_rule_sql,
-    get_network_policy_sql,
-    get_alter_network_policy_sql,
-    get_update_network_rule_sql,
-    get_setup_network_for_user_sql,
-)
 from sfutils_networks._presets import NetworkRuleMode, NetworkRuleType
-
+from sfutils_networks.network import (
+    _assert_safe_identifier,
+    _sql_str,
+    get_alter_network_policy_sql,
+    get_network_policy_sql,
+    get_network_rule_sql,
+    get_setup_network_for_user_sql,
+    get_update_network_rule_sql,
+    normalize_identifier,
+)
 
 # ---------------------------------------------------------------------------
 # _sql_str

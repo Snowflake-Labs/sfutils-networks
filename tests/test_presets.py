@@ -5,23 +5,23 @@ validate_mode_type, get_valid_types_for_mode, get_github_actions_ips,
 get_google_ips, get_local_ip, collect_ipv4_cidrs.
 """
 
-import pytest
-import requests
 from unittest.mock import MagicMock, patch
 
 import click
+import pytest
+import requests
 
 from sfutils_networks._presets import (
-    _validate_cidr,
-    _is_ipv4_cidr,
     NetworkRuleMode,
     NetworkRuleType,
-    validate_mode_type,
-    get_valid_types_for_mode,
+    _is_ipv4_cidr,
+    _validate_cidr,
+    collect_ipv4_cidrs,
     get_github_actions_ips,
     get_google_ips,
     get_local_ip,
-    collect_ipv4_cidrs,
+    get_valid_types_for_mode,
+    validate_mode_type,
 )
 
 # ---------------------------------------------------------------------------
@@ -254,9 +254,11 @@ class TestGetGithubActionsIps:
     def test_http_error_propagates(self):
         mock_resp = MagicMock()
         mock_resp.raise_for_status.side_effect = requests.HTTPError("403")
-        with patch("sfutils_networks._presets.requests.get", return_value=mock_resp):
-            with pytest.raises(requests.HTTPError):
-                get_github_actions_ips()
+        with (
+            patch("sfutils_networks._presets.requests.get", return_value=mock_resp),
+            pytest.raises(requests.HTTPError),
+        ):
+            get_github_actions_ips()
 
     def test_cidrs_are_normalised_via_validate_cidr(self):
         # 10.0.0.5/24 has host bits set; strict=False normalises to 10.0.0.0/24
@@ -312,9 +314,11 @@ class TestGetGoogleIps:
     def test_http_error_propagates(self):
         mock_resp = MagicMock()
         mock_resp.raise_for_status.side_effect = requests.HTTPError("500")
-        with patch("sfutils_networks._presets.requests.get", return_value=mock_resp):
-            with pytest.raises(requests.HTTPError):
-                get_google_ips()
+        with (
+            patch("sfutils_networks._presets.requests.get", return_value=mock_resp),
+            pytest.raises(requests.HTTPError),
+        ):
+            get_google_ips()
 
     def test_calls_gstatic_endpoint(self):
         mock_resp = MagicMock()
@@ -349,16 +353,20 @@ class TestGetLocalIp:
     def test_invalid_ip_from_ipify_raises(self):
         mock_resp = MagicMock()
         mock_resp.text = "not-an-ip"
-        with patch("sfutils_networks._presets.requests.get", return_value=mock_resp):
-            with pytest.raises(click.ClickException, match="Invalid CIDR"):
-                get_local_ip()
+        with (
+            patch("sfutils_networks._presets.requests.get", return_value=mock_resp),
+            pytest.raises(click.ClickException, match="Invalid CIDR"),
+        ):
+            get_local_ip()
 
     def test_http_error_propagates(self):
         mock_resp = MagicMock()
         mock_resp.raise_for_status.side_effect = requests.ConnectionError("timeout")
-        with patch("sfutils_networks._presets.requests.get", return_value=mock_resp):
-            with pytest.raises(requests.ConnectionError):
-                get_local_ip()
+        with (
+            patch("sfutils_networks._presets.requests.get", return_value=mock_resp),
+            pytest.raises(requests.ConnectionError),
+        ):
+            get_local_ip()
 
     def test_calls_ipify(self):
         mock_resp = MagicMock()
@@ -380,7 +388,9 @@ class TestCollectIpv4Cidrs:
         assert result == ["1.2.3.4/32"]
 
     def test_gh_only(self):
-        with patch("sfutils_networks._presets.get_github_actions_ips", return_value=("10.0.0.0/8",)):
+        with patch(
+            "sfutils_networks._presets.get_github_actions_ips", return_value=("10.0.0.0/8",)
+        ):
             result = collect_ipv4_cidrs(with_local=False, with_gh=True, with_google=False)
         assert result == ["10.0.0.0/8"]
 

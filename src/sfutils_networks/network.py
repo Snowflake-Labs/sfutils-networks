@@ -26,6 +26,7 @@ import re
 
 import click
 from dotenv import load_dotenv
+
 from sfutils_networks._presets import (
     NetworkRuleMode,
     NetworkRuleType,
@@ -211,7 +212,11 @@ def create_network_rule(
             for policy in attached_policies:
                 detach_rule_from_policy(policy, admin_role=admin_role)
 
-        setup_sql = f"USE ROLE {admin_role};\nCREATE DATABASE IF NOT EXISTS {db};\nCREATE SCHEMA IF NOT EXISTS {db}.{schema};\n"
+        setup_sql = (
+            f"USE ROLE {admin_role};\n"
+            f"CREATE DATABASE IF NOT EXISTS {db};\n"
+            f"CREATE SCHEMA IF NOT EXISTS {db}.{schema};\n"
+        )
         run_snow_sql_stdin(setup_sql + sql)
 
         if attached_policies:
@@ -433,7 +438,10 @@ def detach_rule_from_policy(policy_name: str, admin_role: str = "accountadmin") 
     """Temporarily detach all rules from a policy (SET to empty list)."""
     _assert_safe_identifier(policy_name, "policy_name")
     _assert_safe_identifier(admin_role, "admin_role")
-    sql = f"USE ROLE {admin_role};\nALTER NETWORK POLICY IF EXISTS {policy_name} SET ALLOWED_NETWORK_RULE_LIST = ();"
+    sql = (
+        f"USE ROLE {admin_role};\n"
+        f"ALTER NETWORK POLICY IF EXISTS {policy_name} SET ALLOWED_NETWORK_RULE_LIST = ();"
+    )
     run_snow_sql_stdin(sql)
 
 
@@ -443,7 +451,11 @@ def reattach_rule_to_policy(
     """Re-attach a rule to a policy."""
     _assert_safe_identifier(policy_name, "policy_name")
     _assert_safe_identifier(admin_role, "admin_role")
-    sql = f"USE ROLE {admin_role};\nALTER NETWORK POLICY IF EXISTS {policy_name} SET ALLOWED_NETWORK_RULE_LIST = ('{_sql_str(rule_fqn)}');"
+    sql = (
+        f"USE ROLE {admin_role};\n"
+        f"ALTER NETWORK POLICY IF EXISTS {policy_name} "
+        f"SET ALLOWED_NETWORK_RULE_LIST = ('{_sql_str(rule_fqn)}');"
+    )
     run_snow_sql_stdin(sql)
 
 
@@ -851,7 +863,8 @@ def rule_update_cmd(
         network.py rule update --name ci_rule --db my_db --allow-gh --no-local
 
         # Replace with specific CIDRs
-        network.py rule update --name my_rule --db my_db --values "10.0.0.0/8,192.168.1.0/24" --no-local
+        network.py rule update --name my_rule --db my_db \
+            --values "10.0.0.0/8,192.168.1.0/24" --no-local
     """
     extra = [v.strip() for v in values.split(",")] if values else None
     all_values = collect_ipv4_cidrs(allow_local, allow_gh, allow_google, extra)
@@ -931,7 +944,9 @@ def rule_list_cmd(db: str, schema: str, admin_role: str) -> None:
     "--yes", "-y", is_flag=True, default=False,
     help="Skip interactive confirmation (use after reviewing dry-run output)",
 )
-def policy_create_cmd(name: str, rules: str, dry_run: bool, force: bool, output: str, yes: bool) -> None:
+def policy_create_cmd(
+    name: str, rules: str, dry_run: bool, force: bool, output: str, yes: bool
+) -> None:
     """
     Create a network policy with specified rules.
 
