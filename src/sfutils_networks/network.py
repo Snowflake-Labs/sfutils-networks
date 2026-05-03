@@ -22,14 +22,22 @@ Provides:
 - IPv4 preset support (GitHub Actions, Google, local IP)
 """
 
+import contextlib
+import datetime
+import json
 import re
+import subprocess
+from pathlib import Path
 
 import click
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 from sfutils_networks._presets import (
+    EGRESS_PRESET_NAMES,
+    SNOWFLAKE_MANAGED_GITHUB_ACTIONS_RULE_FQN,
     NetworkRuleMode,
     NetworkRuleType,
+    collect_egress_hosts,
     collect_ipv4_cidrs,
     get_valid_types_for_mode,
     validate_mode_type,
@@ -37,7 +45,18 @@ from sfutils_networks._presets import (
 from sfutils_networks._snow import (
     run_snow_sql,
     run_snow_sql_stdin,
+    set_connection,
     set_snow_cli_options,
+)
+from sfutils_networks._toml_manifest import (
+    ensure_manifest_defaults,
+    load_manifest,
+    resolve_rule_admin_role,
+    resolve_rule_connection,
+    save_manifest,
+    update_resource_status,
+    upsert_resource,
+    validate_manifest,
 )
 
 
@@ -391,6 +410,107 @@ def delete_network_policy(policy_name: str, admin_role: str = "accountadmin") ->
     run_snow_sql_stdin(f"USE ROLE {admin_role};\nDROP NETWORK POLICY IF EXISTS {policy_name}")
 
 
+# ---------------------------------------------------------------------------
+# External Access Integration helpers
+# ---------------------------------------------------------------------------
+
+
+def get_external_access_integration_sql(
+    name: str,
+    network_rule_fqns: list[str],
+    secrets: list[str] | None = None,
+    comment: str = "",
+    force: bool = False,
+) -> str:
+    """Generate CREATE [OR REPLACE] EXTERNAL ACCESS INTEGRATION SQL."""
+    _assert_safe_identifier(name, "name")
+    kw = "CREATE OR REPLACE" if force else "CREATE EXTERNAL ACCESS INTEGRATION IF NOT EXISTS"
+    rule_list = ", ".join(f"'{_sql_str(r)}'" for r in network_rule_fqns)
+    secret_clause = ""
+    if secrets:
+        secret_list = ", ".join(f"'{_sql_str(s)}'" for s in secrets)
+        secret_clause = f"\n  ALLOWED_AUTHENTICATION_TOKENS_SECRETS = ({secret_list})"
+    comment_text = comment or "Created by sfutils-networks"
+    return (
+        f"{kw} {name}\n"
+        f"  ALLOWED_NETWORK_RULES = ({rule_list})"
+        f"{secret_clause}\n"
+        f"  ENABLED = TRUE\n"
+        f"  COMMENT = '{_sql_str(comment_text)}';"
+    )
+
+
+def get_eai_current_rules(name: str, admin_role: str = "accountadmin") -> list[str]:
+    """DESC EXTERNAL ACCESS INTEGRATION and return ALLOWED_NETWORK_RULES list."""
+    _assert_safe_identifier(name, "name")
+    rows = run_snow_sql(f"DESC EXTERNAL ACCESS INTEGRATION {name}", role=admin_role) or []
+    for row in rows:
+        if row.get("property") == "ALLOWED_NETWORK_RULES":
+            val = row.get("property_value", "")
+            return [r.strip().strip("'\"") for r in val.split(",") if r.strip()]
+    return []
+
+
+def get_alter_external_access_integration_sql(name: str, full_rule_fqns: list[str]) -> str:
+    """ALTER EXTERNAL ACCESS INTEGRATION SET ALLOWED_NETWORK_RULES = (full list)."""
+    _assert_safe_identifier(name, "name")
+    rule_list = ", ".join(f"'{_sql_str(r)}'" for r in full_rule_fqns)
+    return f"ALTER EXTERNAL ACCESS INTEGRATION {name} SET ALLOWED_NETWORK_RULES = ({rule_list});"
+
+
+def create_external_access_integration(
+    name: str, network_rule_fqns: list[str], secrets: list[str] | None = None,
+    comment: str = "", dry_run: bool = False, force: bool = False, admin_role: str = "accountadmin",
+) -> None:
+    """Create an External Access Integration referencing EGRESS network rule(s)."""
+    _assert_safe_identifier(name, "name")
+    _assert_safe_identifier(admin_role, "admin_role")
+    sql = get_external_access_integration_sql(name, network_rule_fqns, secrets, comment, force)
+    if dry_run:
+        click.echo(sql)
+    else:
+        run_snow_sql_stdin(f"USE ROLE {admin_role};\n{sql}")
+
+
+def alter_external_access_integration(
+    name: str,
+    add_rule_fqns: list[str],
+    dry_run: bool = False,
+    admin_role: str = "accountadmin",
+) -> None:
+    """Add network rule(s) to an existing EAI (GET current + union + SET).
+
+    In dry-run mode skips the DESC query and shows SET with only the new rules
+    (full union requires the EAI to exist in Snowflake).
+    """
+    _assert_safe_identifier(name, "name")
+    _assert_safe_identifier(admin_role, "admin_role")
+    if dry_run:
+        # Skip DESC in dry-run — show SET with the new rules only
+        sql = get_alter_external_access_integration_sql(name, add_rule_fqns)
+        click.echo(sql)
+        return
+    existing = get_eai_current_rules(name, admin_role=admin_role)
+    full_list = list(dict.fromkeys(existing + add_rule_fqns))
+    sql = get_alter_external_access_integration_sql(name, full_list)
+    run_snow_sql_stdin(f"USE ROLE {admin_role};\n{sql}")
+
+
+def list_external_access_integrations(admin_role: str = "accountadmin") -> list[dict]:
+    """List External Access Integrations via SHOW EXTERNAL ACCESS INTEGRATIONS."""
+    result = run_snow_sql("SHOW EXTERNAL ACCESS INTEGRATIONS", role=admin_role)
+    return result if isinstance(result, list) else []
+
+
+def delete_external_access_integration(name: str, admin_role: str = "accountadmin") -> None:
+    """Drop an External Access Integration (idempotent)."""
+    _assert_safe_identifier(name, "name")
+    _assert_safe_identifier(admin_role, "admin_role")
+    run_snow_sql_stdin(
+        f"USE ROLE {admin_role};\nDROP EXTERNAL ACCESS INTEGRATION IF EXISTS {name}"
+    )
+
+
 def list_network_rules(db: str, schema: str, admin_role: str = "accountadmin") -> list[dict]:
     """List network rules in a schema."""
     _assert_safe_identifier(db, "db")
@@ -640,16 +760,64 @@ MODE_CHOICES = ["ingress", "internal_stage", "egress", "postgres_ingress", "post
 TYPE_CHOICES = ["ipv4", "host_port", "private_host_port", "awsvpceid"]
 
 
-# Auto-load .env from current working directory so callers
-# don't need ``set -a && source .env && set +a`` before invoking.
-load_dotenv()
+def _begin_rule_create(
+    manifest_path: Path,
+    label: str,
+    rule_name: str,
+    db: str,
+    admin_role: str,
+) -> None:
+    """Write status=CREATE_IN_PROGRESS to manifest BEFORE first SQL runs.
+
+    This ensures the manifest always reflects current intent even if creation
+    fails mid-way.  _persist_rule_state() will overwrite with COMPLETE on success.
+    Idempotent: skips the write if the entry already has status=COMPLETE
+    (so a dry-run + confirm re-run doesn't regress a healthy entry).
+    """
+    data = load_manifest(manifest_path)
+    ensure_manifest_defaults(data, manifest_path)
+    existing = data.get("rule", {}).get(label)
+    if existing and existing.get("status") == "COMPLETE":
+        return
+    _now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    upsert_resource(data, label, {
+        "status":     "CREATE_IN_PROGRESS",
+        "created_at": _now,
+        "updated_at": _now,
+        "rule_name":  rule_name.upper(),
+        "sf_utils_db": db.upper(),
+        "admin_role":  admin_role,
+    })
+    save_manifest(manifest_path, data)
+    click.echo(f"[manifest] '{label}' → CREATE_IN_PROGRESS", err=True)
+
+
+def _persist_rule_state(
+    manifest_path: Path,
+    label: str,
+    rule_config: dict,
+) -> None:
+    """Write rule entry to manifest.toml with status=COMPLETE on success."""
+    data = load_manifest(manifest_path)
+    ensure_manifest_defaults(data, manifest_path)
+    upsert_resource(data, label, rule_config)
+    save_manifest(manifest_path, data)
+    click.echo(f"✓ Updated {manifest_path} with rule entry '{label}'")
 
 
 @click.group()
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
 @click.option("--debug", "-d", is_flag=True, help="Enable debug output")
+@click.option(
+    "--manifest-path",
+    "-m",
+    type=click.Path(path_type=Path),
+    default=Path(".sfutils/manifest.toml"),
+    show_default=True,
+    help="Path to TOML manifest (default: .sfutils/manifest.toml)",
+)
 @click.pass_context
-def cli(ctx: click.Context, verbose: bool, debug: bool) -> None:
+def cli(ctx: click.Context, verbose: bool, debug: bool, manifest_path: Path) -> None:
     """
     Snowflake Network Rule Manager.
 
@@ -658,11 +826,62 @@ def cli(ctx: click.Context, verbose: bool, debug: bool) -> None:
 
     \b
     Commands:
-      rule    - Manage network rules (create, list, delete)
-      policy  - Manage network policies (create, list, delete)
+      rule              - Manage network rules (create, list, delete)
+      policy            - Manage network policies (create, list, delete)
+      integration       - Manage External Access Integrations (EGRESS rules)
+      list              - List all rules from manifest.toml
+      setup-connection  - Cache Snowflake connection in manifest.toml
+      validate-manifest - Validate (and optionally repair) manifest.toml
+      migrate           - Migrate legacy .env + manifest.md to manifest.toml
     """
     set_snow_cli_options(verbose=verbose, debug=debug)
     ctx.ensure_object(dict)
+    ctx.obj["manifest_path"] = manifest_path
+
+    # Set connection from manifest so all snow SQL calls use -c <connection>.
+    _manifest = load_manifest(manifest_path)
+    _conn = resolve_rule_connection({}, _manifest)
+    if _conn:
+        set_connection(_conn)
+
+    # ── Manifest auto-gate ────────────────────────────────────────────────────
+    # Runs before EVERY subcommand. If manifest exists and is broken:
+    #   1. Auto-repair structural gaps (missing schema_version, [snowflake],
+    #      [prereqs] sections) via ensure_manifest_defaults — silent success.
+    #   2. Warn loudly about non-structural issues that need manual action
+    #      (empty connection, infra_ready=false, missing rule fields, etc.).
+    # New projects with no manifest yet are skipped — setup-connection / create
+    # will initialise it correctly.
+    if manifest_path.exists() and ctx.invoked_subcommand not in (
+        "validate-manifest",
+        "setup-connection",
+    ):
+        _gdata = load_manifest(manifest_path)
+        _issues_before = validate_manifest(_gdata)
+        if _issues_before:
+            ensure_manifest_defaults(_gdata, manifest_path)
+            save_manifest(manifest_path, _gdata)
+            _issues_after = validate_manifest(_gdata)
+            if _issues_after:
+                click.echo(
+                    f"\n⚠️  manifest.toml has {len(_issues_after)} issue(s) "
+                    "that need attention before this operation:",
+                    err=True,
+                )
+                for _issue in _issues_after:
+                    click.echo(f"   ✗ {_issue}", err=True)
+                click.echo(
+                    "   Run 'nw validate-manifest' for details\n",
+                    err=True,
+                )
+            else:
+                click.echo(
+                    f"[manifest] auto-repaired {len(_issues_before)} structural gap(s)",
+                    err=True,
+                )
+
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
 
 
 @cli.group()
@@ -710,6 +929,12 @@ def policy() -> None:
 )
 @click.option("--allow-gh", "-G", is_flag=True, help="Include GitHub Actions IPs (IPV4 only)")
 @click.option("--allow-google", "-g", is_flag=True, help="Include Google IPs (IPV4 only)")
+@click.option(
+    "--preset",
+    multiple=True,
+    type=click.Choice(EGRESS_PRESET_NAMES, case_sensitive=False),
+    help="Intent vocabulary preset for HOST_PORT rules (repeatable: --preset slack --preset aws)",
+)
 @click.option("--dry-run", is_flag=True, help="Preview SQL without executing")
 @click.option(
     "--force",
@@ -730,13 +955,28 @@ def policy() -> None:
     help="Policy mode: 'create' (replace) or 'alter' (add to existing)",
 )
 @click.option(
+    "--integration",
+    "-i",
+    "integration_name",
+    default=None,
+    help="Also create/update External Access Integration with this name (EGRESS HOST_PORT only)",
+)
+@click.option(
+    "--integration-mode",
+    type=click.Choice(["create", "alter"], case_sensitive=False),
+    default="create",
+    help="Integration mode: 'create' (new EAI) or 'alter' (add rule to existing EAI)",
+)
+@click.option(
     "-o", "--output", type=click.Choice(["text", "json"]), default="text", help="Output format"
 )
 @click.option(
     "--yes", "-y", is_flag=True, default=False,
     help="Skip interactive confirmation (use after reviewing dry-run output)",
 )
+@click.pass_context
 def rule_create(
+    ctx: click.Context,
     name: str,
     db: str,
     schema: str,
@@ -746,10 +986,13 @@ def rule_create(
     allow_local: bool,
     allow_gh: bool,
     allow_google: bool,
+    preset: tuple[str, ...],
     dry_run: bool,
     force: bool,
     policy_name: str | None,
     policy_mode: str,
+    integration_name: str | None,
+    integration_mode: str,
     output: str,
     yes: bool,
 ) -> None:
@@ -784,6 +1027,11 @@ def rule_create(
     mode_enum = NetworkRuleMode(mode.upper())
     type_enum = NetworkRuleType(rule_type.upper())
 
+    manifest_path: Path = ctx.obj.get("manifest_path", Path(".sfutils/manifest.toml"))
+    _mdata = load_manifest(manifest_path)
+    label = name.upper().lower().replace("_", "-")
+    resolved_role = resolve_rule_admin_role({}, _mdata)
+
     has_presets = allow_local or allow_gh or allow_google
     if has_presets and type_enum != NetworkRuleType.IPV4:
         raise click.ClickException(
@@ -793,19 +1041,47 @@ def rule_create(
 
     if type_enum == NetworkRuleType.IPV4:
         extra = [v.strip() for v in values.split(",")] if values else None
-        all_values = collect_ipv4_cidrs(allow_local, allow_gh, allow_google, extra)
-    else:
-        if not values:
-            raise click.ClickException(f"--values required for type {rule_type}")
+        # --allow-gh uses the Snowflake-managed SaaS rule, not snapshot CIDRs
+        all_values = collect_ipv4_cidrs(allow_local, False, allow_google, extra)
+    elif preset:
+        preset_hosts = collect_egress_hosts(list(preset))
+        custom_hosts = [v.strip() for v in values.split(",")] if values else []
+        all_values = list(dict.fromkeys(preset_hosts + custom_hosts))
+    elif values:
         all_values = [v.strip() for v in values.split(",")]
+    else:
+        all_values = []
 
-    if not all_values:
+    # GitHub-only case: allow_gh with no custom IPs — policy-only, no custom rule
+    github_only = allow_gh and not all_values
+
+    if not all_values and not allow_gh:
         raise click.ClickException("No values specified.")
 
-    click.echo(
-        f"Creating {mode.upper()} network rule ({rule_type.upper()}) "
-        f"with {len(all_values)} value(s)..."
-    )
+    # GitHub managed rule requires a policy to be meaningful
+    if allow_gh and not policy_name:
+        raise click.ClickException(
+            "--allow-gh requires --policy <name>: the managed GitHub rule "
+            f"({SNOWFLAKE_MANAGED_GITHUB_ACTIONS_RULE_FQN}) must be added to a "
+            "network policy to take effect."
+        )
+
+    if github_only:
+        click.echo(
+            "No custom IPs specified — policy will reference only "
+            f"{SNOWFLAKE_MANAGED_GITHUB_ACTIONS_RULE_FQN}"
+        )
+    else:
+        click.echo(
+            f"Creating {mode.upper()} network rule ({rule_type.upper()}) "
+            f"with {len(all_values)} value(s)..."
+        )
+        if allow_gh:
+            click.echo(
+                f"  + hybrid policy: {SNOWFLAKE_MANAGED_GITHUB_ACTIONS_RULE_FQN}"
+            )
+        if preset and type_enum != NetworkRuleType.IPV4:
+            click.echo(f"  Presets: {', '.join(preset)}")
 
     if dry_run:
         click.echo("SQL that would be executed:")
@@ -815,32 +1091,101 @@ def rule_create(
             click.echo("Aborted.")
             return
 
-    fqn = create_network_rule(
-        name.upper(),
-        db.upper(),
-        schema.upper(),
-        all_values,
-        mode_enum,
-        type_enum,
-        dry_run=dry_run,
-        force=force,
-    )
+    fqn: str | None = None
+    if not github_only:
+        if not dry_run:
+            _begin_rule_create(manifest_path, label, name, db, resolved_role)
 
-    if not dry_run:
-        click.echo(f"✓ Created rule: {fqn}")
+        fqn = create_network_rule(
+            name.upper(),
+            db.upper(),
+            schema.upper(),
+            all_values,
+            mode_enum,
+            type_enum,
+            dry_run=dry_run,
+            force=force,
+            admin_role=resolved_role,
+        )
+
+        if not dry_run:
+            click.echo(f"✓ Created rule: {fqn}")
 
     if policy_name:
         policy_upper = policy_name.upper()
+        # Build policy refs: custom rule (if any) + optional managed GitHub rule
+        policy_refs: list[str] = []
+        if fqn:
+            policy_refs.append(fqn)
+        if allow_gh:
+            policy_refs.append(SNOWFLAKE_MANAGED_GITHUB_ACTIONS_RULE_FQN)
+
         if policy_mode.lower() == "alter":
-            click.echo(f"Adding rule to policy: {policy_upper}")
-            alter_network_policy(policy_upper, [fqn], dry_run=dry_run)
+            click.echo(f"Adding rule(s) to policy: {policy_upper}")
+            alter_network_policy(
+                policy_upper, policy_refs, dry_run=dry_run, admin_role=resolved_role
+            )
             if not dry_run:
                 click.echo(f"✓ Updated policy: {policy_upper}")
         else:
             click.echo(f"Creating policy: {policy_upper}")
-            create_network_policy(policy_upper, [fqn], dry_run=dry_run, force=force)
+            create_network_policy(
+                policy_upper, policy_refs, dry_run=dry_run, force=force, admin_role=resolved_role
+            )
             if not dry_run:
                 click.echo(f"✓ Created policy: {policy_upper}")
+
+    # EAI: only for EGRESS HOST_PORT
+    if integration_name and fqn:
+        integration_upper = integration_name.upper()
+        if integration_mode.lower() == "alter":
+            click.echo(f"Adding rule to EAI: {integration_upper}")
+            alter_external_access_integration(
+                integration_upper, [fqn], dry_run=dry_run, admin_role=resolved_role
+            )
+            if not dry_run:
+                click.echo(f"✓ Updated EAI: {integration_upper}")
+        else:
+            click.echo(f"Creating EAI: {integration_upper}")
+            create_external_access_integration(
+                integration_upper, [fqn], dry_run=dry_run, force=force, admin_role=resolved_role
+            )
+            if not dry_run:
+                click.echo(f"✓ Created EAI: {integration_upper}")
+                click.echo(
+                    f"\n  Reference: EXTERNAL_ACCESS_INTEGRATIONS = ('{integration_upper}')"
+                )
+
+    if not dry_run:
+        _now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _eai = integration_name.upper() if integration_name else ""
+        _rule_config: dict = {
+            "status":      "COMPLETE",
+            "created_at":  _now,
+            "updated_at":  _now,
+            "rule_name":   name.upper() if not github_only else "",
+            "rule_mode":   mode.upper(),
+            "rule_type":   rule_type.upper(),
+            "value_list":  all_values,
+            "policy_name": policy_name.upper() if policy_name else "",
+            "allow_github": allow_gh,
+            "allow_google": allow_google,
+            "sf_utils_db": db.upper(),
+            "admin_role":  resolved_role,
+            "resources": {
+                "network_rule":    fqn or "",
+                "network_policy":  policy_name.upper() if policy_name else "",
+                "integration_name": _eai,
+            },
+            "cleanup": {
+                "rule_name":       name.upper() if not github_only else "",
+                "policy_name":     policy_name.upper() if policy_name else "",
+                "integration_name": _eai,
+                "db":              db.upper(),
+            },
+        }
+        if not github_only:
+            _persist_rule_state(manifest_path, label, _rule_config)
 
 
 @rule.command(name="update")
@@ -853,7 +1198,11 @@ def rule_create(
     default=True,
     help="Include local IP (IPV4 only, default: ON)",
 )
-@click.option("--allow-gh", "-G", is_flag=True, help="Include GitHub Actions IPs (IPV4 only)")
+@click.option(
+    "--allow-gh", "-G", is_flag=True,
+    help="NOTE: --allow-gh on update only affects VALUE_LIST (no snapshot). "
+         "To add GITHUBACTIONS_GLOBAL to a policy, use 'nw policy alter'.",
+)
 @click.option("--allow-google", "-g", is_flag=True, help="Include Google IPs (IPV4 only)")
 @click.option("--dry-run", is_flag=True, help="Preview SQL without executing")
 def rule_update_cmd(
@@ -877,19 +1226,17 @@ def rule_update_cmd(
         # Update with new local IP (e.g., after IP change)
         network.py rule update --name my_rule --db my_db
 
-        # Replace with GitHub Actions IPs
-        network.py rule update --name ci_rule --db my_db --allow-gh --no-local
-
         # Replace with specific CIDRs
         network.py rule update --name my_rule --db my_db \
             --values "10.0.0.0/8,192.168.1.0/24" --no-local
     """
     extra = [v.strip() for v in values.split(",")] if values else None
-    all_values = collect_ipv4_cidrs(allow_local, allow_gh, allow_google, extra)
+    # --allow-gh is ignored for VALUE_LIST update (use 'nw policy alter' for managed rule)
+    all_values = collect_ipv4_cidrs(allow_local, False, allow_google, extra)
 
     if not all_values:
         raise click.ClickException(
-            "No values specified. Use --allow-local, --allow-gh, --allow-google, or --values"
+            "No values specified. Use --allow-local, --allow-google, or --values"
         )
 
     fqn = f"{db}.{schema}.{name}".upper()
@@ -911,12 +1258,60 @@ def rule_update_cmd(
 @click.option("--name", "-n", required=True, envvar="NW_RULE_NAME", help="Network rule name")
 @click.option("--db", required=True, envvar="NW_RULE_DB", help="Database name")
 @click.option("--schema", "-s", default="NETWORKS", envvar="NW_RULE_SCHEMA", help="Schema name")
-@click.confirmation_option(prompt="Delete this network rule?")
-def rule_delete_cmd(name: str, db: str, schema: str) -> None:
-    """Delete a network rule."""
+@click.option(
+    "--admin-role", "-a", default=None,
+    help="Admin role for dropping resources (default: from manifest or ACCOUNTADMIN)",
+)
+@click.option(
+    "--yes", "-y", is_flag=True, default=False,
+    help="Skip interactive confirmation",
+)
+@click.pass_context
+def rule_delete_cmd(
+    ctx: click.Context, name: str, db: str, schema: str, admin_role: str | None, yes: bool
+) -> None:
+    """Delete a network rule and its associated policy (manifest-driven)."""
+    manifest_path: Path = ctx.obj.get("manifest_path", Path(".sfutils/manifest.toml"))
+    _mdata = load_manifest(manifest_path)
+    resolved_role = admin_role or resolve_rule_admin_role({}, _mdata)
+
     fqn = f"{db}.{schema}.{name}".upper()
     click.echo(f"Deleting network rule: {fqn}")
-    delete_network_rule(name.upper(), db.upper(), schema.upper())
+
+    if not yes and not click.confirm("Delete this network rule?", default=False):
+        click.echo("Aborted.")
+        return
+
+    # Write DELETE_IN_PROGRESS before any DROP runs.
+    _del_data = load_manifest(manifest_path)
+    update_resource_status(_del_data, name, "DELETE_IN_PROGRESS")
+    save_manifest(manifest_path, _del_data)
+    click.echo(f"[manifest] '{name.upper()}' → DELETE_IN_PROGRESS", err=True)
+
+    # Look up associated policy from manifest for cleanup.
+    _rule_entry = None
+    for _entry in _del_data.get("rule", {}).values():
+        if _entry.get("rule_name", "").upper() == name.upper():
+            _rule_entry = _entry
+            break
+    _cleanup = (_rule_entry or {}).get("cleanup", {})
+    _policy_name = _cleanup.get("policy_name", "")
+    _eai_name = _cleanup.get("integration_name", "")
+
+    if _policy_name:
+        click.echo(f"Deleting associated policy: {_policy_name}")
+        delete_network_policy(_policy_name, admin_role=resolved_role)
+
+    if _eai_name:
+        click.echo(f"Deleting associated EAI: {_eai_name}")
+        delete_external_access_integration(_eai_name, admin_role=resolved_role)
+
+    delete_network_rule(name.upper(), db.upper(), schema.upper(), admin_role=resolved_role)
+
+    # Write REMOVED after all drops succeed.
+    _fin_data = load_manifest(manifest_path)
+    update_resource_status(_fin_data, name, "REMOVED")
+    save_manifest(manifest_path, _fin_data)
     click.echo(f"✓ Deleted: {fqn}")
 
 
@@ -1062,11 +1457,18 @@ def policy_delete_cmd(name: str, user: str | None, admin_role: str) -> None:
     default="accountadmin",
     help="Admin role for listing resources",
 )
-def policy_list_cmd(admin_role: str) -> None:
+@click.option(
+    "-o", "--output", type=click.Choice(["text", "json"]), default="text", help="Output format"
+)
+def policy_list_cmd(admin_role: str, output: str) -> None:
     """List all network policies."""
-    click.echo("Network policies:")
     policies = list_network_policies(admin_role=admin_role)
 
+    if output == "json":
+        click.echo(json.dumps([p.get("name", "") for p in policies]))
+        return
+
+    click.echo("Network policies:")
     if not policies:
         click.echo("  (none)")
         return
@@ -1092,6 +1494,604 @@ def policy_assign_cmd(name: str, user: str, admin_role: str) -> None:
     click.echo(f"Assigning policy {policy_upper} to user {user_upper}...")
     assign_network_policy_to_user(user_upper, policy_upper, admin_role=admin_role)
     click.echo(f"✓ Assigned {policy_upper} to {user_upper}")
+
+
+# ---------------------------------------------------------------------------
+# nw integration — External Access Integration commands
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def integration() -> None:
+    """Manage External Access Integrations (for EGRESS HOST_PORT rules)."""
+    pass
+
+
+@integration.command(name="create")
+@click.option("--name", "-n", required=True, help="Integration name")
+@click.option("--rules", "-r", required=True,
+              help="Comma-separated fully qualified EGRESS rule FQNs")
+@click.option("--secrets", help="Comma-separated secret FQNs (optional)")
+@click.option("--dry-run", is_flag=True, help="Preview SQL without executing")
+@click.option("--force", "-f", is_flag=True, help="CREATE OR REPLACE")
+@click.option("--admin-role", "-a", default=None, help="Admin role (default: from manifest)")
+@click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation")
+@click.pass_context
+def integration_create_cmd(
+    ctx: click.Context, name: str, rules: str, secrets: str | None,
+    dry_run: bool, force: bool, admin_role: str | None, yes: bool,
+) -> None:
+    """Create an External Access Integration for EGRESS HOST_PORT rule(s).
+
+    \b
+    After creation, reference in your function/procedure/SPCS service:
+        EXTERNAL_ACCESS_INTEGRATIONS = ('<NAME>')
+    """
+    manifest_path: Path = ctx.obj.get("manifest_path", Path(".sfutils/manifest.toml"))
+    _mdata = load_manifest(manifest_path)
+    resolved_role = admin_role or resolve_rule_admin_role({}, _mdata)
+    rule_fqns = [r.strip().upper() for r in rules.split(",")]
+    secret_list = [s.strip() for s in secrets.split(",")] if secrets else None
+    integration_upper = name.upper()
+    click.echo(f"Creating External Access Integration: {integration_upper}")
+    click.echo(f"  Allowed rules: {', '.join(rule_fqns)}")
+    if dry_run:
+        click.echo("SQL that would be executed:")
+        click.echo("─" * 60)
+    elif not yes and not click.confirm("\nProceed?", default=True):
+        click.echo("Aborted.")
+        return
+    create_external_access_integration(
+        integration_upper, rule_fqns, secret_list,
+        dry_run=dry_run, force=force, admin_role=resolved_role,
+    )
+    if not dry_run:
+        click.echo(f"✓ Created: {integration_upper}")
+        click.echo(f"\n  Reference: EXTERNAL_ACCESS_INTEGRATIONS = ('{integration_upper}')")
+
+
+@integration.command(name="alter")
+@click.option("--name", "-n", required=True, help="Integration name")
+@click.option("--add-rules", required=True, help="Comma-separated FQN rule names to add")
+@click.option("--dry-run", is_flag=True)
+@click.option("--admin-role", "-a", default=None)
+@click.option("--yes", "-y", is_flag=True, default=False)
+@click.pass_context
+def integration_alter_cmd(
+    ctx: click.Context, name: str, add_rules: str, dry_run: bool, admin_role: str | None, yes: bool,
+) -> None:
+    """Add network rule(s) to an existing External Access Integration."""
+    manifest_path: Path = ctx.obj.get("manifest_path", Path(".sfutils/manifest.toml"))
+    _mdata = load_manifest(manifest_path)
+    resolved_role = admin_role or resolve_rule_admin_role({}, _mdata)
+    rule_fqns = [r.strip().upper() for r in add_rules.split(",")]
+    integration_upper = name.upper()
+    click.echo(f"Adding rule(s) to {integration_upper}: {', '.join(rule_fqns)}")
+    if dry_run:
+        click.echo("SQL that would be executed:")
+        click.echo("─" * 60)
+    elif not yes and not click.confirm("\nProceed?", default=True):
+        click.echo("Aborted.")
+        return
+    alter_external_access_integration(
+        integration_upper, rule_fqns, dry_run=dry_run, admin_role=resolved_role
+    )
+    if not dry_run:
+        click.echo(f"✓ Updated: {integration_upper}")
+
+
+@integration.command(name="list")
+@click.option(
+    "-o", "--output", type=click.Choice(["text", "json"]), default="text", help="Output format"
+)
+@click.option("--admin-role", "-a", default="accountadmin")
+def integration_list_cmd(output: str, admin_role: str) -> None:
+    """List External Access Integrations."""
+    integrations = list_external_access_integrations(admin_role=admin_role)
+    if output == "json":
+        click.echo(json.dumps([i.get("name", "") for i in integrations]))
+        return
+    if not integrations:
+        click.echo("  (none)")
+        return
+    for i in integrations:
+        click.echo(f"  {i.get('name', 'N/A')}")
+
+
+@integration.command(name="delete")
+@click.option("--name", "-n", required=True)
+@click.option("--admin-role", "-a", default=None)
+@click.option("--yes", "-y", is_flag=True, default=False)
+@click.pass_context
+def integration_delete_cmd(
+    ctx: click.Context, name: str, admin_role: str | None, yes: bool
+) -> None:
+    """Delete an External Access Integration."""
+    manifest_path: Path = ctx.obj.get("manifest_path", Path(".sfutils/manifest.toml"))
+    _mdata = load_manifest(manifest_path)
+    resolved_role = admin_role or resolve_rule_admin_role({}, _mdata)
+    if not yes and not click.confirm(f"Delete integration {name.upper()}?", default=False):
+        click.echo("Aborted.")
+        return
+    delete_external_access_integration(name.upper(), admin_role=resolved_role)
+    click.echo(f"✓ Deleted: {name.upper()}")
+
+
+# ---------------------------------------------------------------------------
+# Top-level manifest commands
+# ---------------------------------------------------------------------------
+
+
+@cli.command(name="list")
+@click.pass_context
+def list_command(ctx: click.Context) -> None:
+    """List all network rules recorded in manifest.toml."""
+    manifest_path: Path = ctx.obj.get("manifest_path", Path(".sfutils/manifest.toml"))
+    data = load_manifest(manifest_path)
+    rules = data.get("rule", {})
+
+    if not rules:
+        if not manifest_path.exists():
+            click.echo(f"No manifest found at {manifest_path}. Run 'nw rule create' first.")
+        else:
+            click.echo("No rule entries found in manifest.toml.")
+        return
+
+    click.echo(f"\n{'LABEL':<28} {'RULE_NAME':<40} {'MODE':<18} {'TYPE':<18} {'STATUS'}")
+    click.echo("─" * 115)
+    for label, rule in rules.items():
+        rule_name = rule.get("rule_name", "—")
+        mode = rule.get("rule_mode", "—")
+        rtype = rule.get("rule_type", "—")
+        status = rule.get("status", "—")
+        status_display = (
+            click.style(status, fg="green") if status == "COMPLETE"
+            else click.style(status, fg="yellow") if "IN_PROGRESS" in status
+            else click.style(status, fg="red") if status == "REMOVED"
+            else status
+        )
+        click.echo(f"{label:<28} {rule_name:<40} {mode:<18} {rtype:<18} {status_display}")
+    click.echo()
+
+
+@cli.command(name="validate-manifest")
+@click.option(
+    "--fix",
+    is_flag=True,
+    default=False,
+    help=(
+        "Fill in any missing sections with sensible defaults before validating. "
+        "Useful for repairing manifests from older projects."
+    ),
+)
+@click.pass_context
+def validate_manifest_command(ctx: click.Context, fix: bool) -> None:
+    """Validate manifest.toml structure and report issues.
+
+    Checks that all required sections and fields are present and well-formed.
+    Exits with code 1 if validation fails so it can gate CI/CD workflows.
+
+    Use --fix to automatically fill in any missing sections with defaults.
+
+    \b
+    Example:
+        nw validate-manifest
+        nw validate-manifest --fix   # repair then validate
+    """
+    manifest_path: Path = ctx.obj.get("manifest_path", Path(".sfutils/manifest.toml"))
+
+    if not manifest_path.exists():
+        if fix:
+            data: dict = {}
+            ensure_manifest_defaults(data, manifest_path)
+            save_manifest(manifest_path, data)
+            click.echo(f"✓ Created {manifest_path} with default structure")
+        else:
+            raise click.ClickException(
+                f"manifest.toml not found at {manifest_path}. "
+                "Run 'nw setup-connection' to initialise, "
+                "or use --fix to create a skeleton."
+            )
+    else:
+        data = load_manifest(manifest_path)
+
+    if fix:
+        before = validate_manifest(data)
+        ensure_manifest_defaults(data, manifest_path)
+        save_manifest(manifest_path, data)
+        after = validate_manifest(data)
+        fixed_count = len(before) - len(after)
+        if fixed_count > 0:
+            click.echo(f"✓ Repaired {fixed_count} issue(s) in {manifest_path}")
+        data = load_manifest(manifest_path)
+
+    issues = validate_manifest(data)
+
+    if issues:
+        click.echo(f"✗ manifest.toml validation failed ({len(issues)} issue(s)):", err=True)
+        for issue in issues:
+            click.echo(f"  ✗ {issue}", err=True)
+        if not fix:
+            click.echo(
+                "  Tip: run 'nw validate-manifest --fix' to repair structural gaps",
+                err=True,
+            )
+        raise click.ClickException("Fix the issues above and re-run.")
+
+    rule_count = len(data.get("rule", {}))
+    click.echo(
+        f"✓ manifest.toml is valid  "
+        f"(connection: {data.get('snowflake', {}).get('connection', '(not set)')}, "
+        f"rules: {rule_count})"
+    )
+
+
+@cli.command(name="setup-connection")
+@click.option(
+    "--connection",
+    "-c",
+    required=True,
+    help="Snowflake connection name to use for this project (from snow connection list)",
+)
+@click.option(
+    "--admin-role",
+    default=None,
+    help="Admin role to cache in manifest.toml (default: ACCOUNTADMIN)",
+)
+@click.pass_context
+def setup_connection_command(
+    ctx: click.Context,
+    connection: str,
+    admin_role: str | None,
+) -> None:
+    """Persist a Snowflake connection to manifest.toml and cache its metadata.
+
+    Run this once per project after picking a connection from 'snow connection list'.
+    Writes [snowflake].connection + account/user/account_url to manifest.toml so
+    manifest.toml becomes the source of truth for this project.
+
+    \b
+    Example:
+        snow connection list              # see available connections
+        nw setup-connection -c local-oauth
+    """
+    manifest_path: Path = ctx.obj.get("manifest_path", Path(".sfutils/manifest.toml"))
+
+    set_connection(connection)
+
+    click.echo(f"Testing connection '{connection}'...")
+    _meta: dict = {}
+    try:
+        _res = subprocess.run(
+            ["snow", "connection", "test", "-c", connection, "--format", "json"],
+            capture_output=True, text=True, check=False,
+        )
+        if _res.returncode == 0 and _res.stdout.strip():
+            _data = json.loads(_res.stdout)
+            _meta = {
+                "account":     str(_data.get("Account") or _data.get("account") or "").strip(),
+                "user":        str(_data.get("User") or _data.get("user") or "").strip(),
+                "account_url": (
+                    f"https://{_data.get('Host') or _data.get('host') or ''}"
+                ).strip(),
+            }
+        else:
+            click.echo(
+                click.style(
+                    "⚠ Connection test failed — saving connection name anyway.", fg="yellow"
+                )
+            )
+    except Exception:
+        pass
+
+    data = load_manifest(manifest_path)
+    ensure_manifest_defaults(data, manifest_path)
+
+    sf = data["snowflake"]
+    sf["connection"] = connection
+    if _meta.get("account"):
+        sf["account"] = _meta["account"]
+    if _meta.get("account_url") and _meta["account_url"] != "https://":
+        sf["account_url"] = _meta["account_url"]
+    if _meta.get("user"):
+        sf["user"] = _meta["user"]
+    if admin_role:
+        sf["admin_role"] = admin_role
+
+    save_manifest(manifest_path, data)
+
+    click.echo(f"✓ Connection '{connection}' saved to {manifest_path}")
+    if _meta.get("account"):
+        click.echo(f"  account:     {_meta['account']}")
+    if _meta.get("account_url") and _meta["account_url"] != "https://":
+        click.echo(f"  account_url: {_meta['account_url']}")
+    if _meta.get("user"):
+        click.echo(f"  user:        {_meta['user']}")
+
+
+def _parse_legacy_manifest(path: Path) -> dict:
+    """Extract structured data from a legacy sfutils-manifest.md file.
+
+    sfutils-manifest.md is the authoritative record of what was created.
+    Returns a dict with whatever fields could be parsed; missing fields are
+    absent from the dict (not None/empty) so callers can chain fallbacks.
+
+    Parsed fields: project_name, tools_verified, admin_role, rule_name,
+    policy_name, rule_mode, rule_type, value_list, sf_utils_db, status,
+    created_at, resources (dict of FQN strings).
+    """
+    if not path.exists():
+        return {}
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+
+    result: dict = {}
+
+    def _s(m_: re.Match | None) -> str | None:
+        return m_.group(1).strip() if m_ else None
+
+    # ── Global sections ───────────────────────────────────────────────────────
+    if v := _s(re.search(r"^project_name:\s*(.+?)$", content, re.MULTILINE)):
+        result["project_name"] = v
+    if v := _s(re.search(r"^tools_verified:\s*(.+?)$", content, re.MULTILINE)):
+        result["tools_verified"] = v
+    # admin_role stored as "sfutils-networks: ROLE"
+    if v := _s(re.search(r"^sfutils-networks:\s*(.+?)$", content, re.MULTILINE)):
+        result["admin_role"] = v
+
+    # ── Network rule section ──────────────────────────────────────────────────
+    # Find the first sfutils-networks block
+    start = content.find("<!-- START -- sfutils-networks:")
+    end_marker = "<!-- END -- sfutils-networks:"
+    end = content.find(end_marker)
+    section = content[start: end if end != -1 else len(content)] if start != -1 else ""
+
+    if section:
+        _kv = [
+            ("rule_name",   r"\*\*Rule Name:\*\*\s*(\S+)"),
+            ("sf_utils_db", r"\*\*Database:\*\*\s*(\S+)"),
+            ("status",      r"(?:\*\*Status:\*\*|^Status:)\s*(\S+)"),
+            ("created_at",  r"\*\*Created:\*\*\s*(.+?)$"),
+        ]
+        for field, pattern in _kv:
+            if v := _s(re.search(pattern, section, re.MULTILINE)):
+                result[field] = v
+
+        # Resource FQNs from the resources table
+        # Row: | N | Type | Name | Location | Status |
+        resources: dict = {}
+        cleanup: dict = {}
+        for row in re.finditer(
+            r"\|\s*\d+\s*\|\s*(.+?)\s*\|\s*(\S+)\s*\|\s*(.+?)\s*\|\s*\w+\s*\|",
+            section,
+        ):
+            rtype = row.group(1).strip().lower()
+            rname = row.group(2).strip()
+            rloc  = row.group(3).strip()
+            if "network rule" in rtype:
+                if "." in rloc:
+                    result.setdefault("sf_utils_db", rloc.split(".")[0])
+                resources["network_rule"] = (
+                    f"{rloc}.{rname}" if rloc not in ("Account", "—") else rname
+                )
+                cleanup["rule_name"] = rname
+                cleanup["db"] = rloc.split(".")[0] if "." in rloc else result.get("sf_utils_db", "")
+            elif "network policy" in rtype:
+                resources["network_policy"] = rname
+                cleanup["policy_name"] = rname
+                result["policy_name"] = rname
+
+        if resources:
+            result["resources"] = resources
+        if cleanup:
+            result["cleanup"] = cleanup
+
+    # Derive rule_mode / rule_type from CLI cleanup command if present
+    # e.g.  nw rule create --name X --mode egress --type host_port
+    _cmd_match = re.search(
+        r"nw\s+rule\s+create[^\n]*--mode\s+(\w+)[^\n]*--type\s+(\w+)", section, re.IGNORECASE
+    )
+    if _cmd_match:
+        result.setdefault("rule_mode", _cmd_match.group(1).upper())
+        result.setdefault("rule_type", _cmd_match.group(2).upper())
+
+    # Default mode/type if still missing
+    result.setdefault("rule_mode", "INGRESS")
+    result.setdefault("rule_type", "IPV4")
+
+    # Migrate legacy bare status → named states
+    _status_migration = {"IN_PROGRESS": "CREATE_IN_PROGRESS"}
+    if "status" in result:
+        result["status"] = _status_migration.get(result["status"], result["status"])
+
+    return result
+
+
+@cli.command(name="migrate")
+@click.option(
+    "--env-path",
+    type=click.Path(path_type=Path),
+    default=Path(".env"),
+    help=".env file to read connection from (default: .env)",
+)
+@click.option(
+    "--manifest-md",
+    type=click.Path(path_type=Path),
+    default=Path(".sfutils/sfutils-manifest.md"),
+    help="Existing markdown manifest to read resources from "
+         "(default: .sfutils/sfutils-manifest.md)",
+)
+@click.option("--dry-run", is_flag=True, help="Print what would be written without writing")
+@click.pass_context
+def migrate_command(
+    ctx: click.Context,
+    env_path: Path,
+    manifest_md: Path,
+    dry_run: bool,
+) -> None:
+    """Migrate .env + sfutils-manifest.md to manifest.toml.
+
+    sfutils-manifest.md is the PRIMARY source — it contains rule_name,
+    policy_name, sf_utils_db, admin_role, project_name, prereqs, resource
+    FQNs, mode/type, and status.
+    .env is SUPPLEMENTARY — it adds the Snowflake connection name that was
+    never stored in the old markdown manifest.
+
+    Always sets infra_ready = false — only check-setup sets it to true.
+    Status defaults to REMOVED if not found in manifest.
+
+    Works correctly even when .env is absent or empty.
+    Does NOT delete the old files.
+
+    \b
+    Example:
+        nw migrate
+        nw migrate --dry-run
+        nw migrate --manifest-md /path/to/sfutils-manifest.md
+    """
+    manifest_path: Path = ctx.obj.get("manifest_path", Path(".sfutils/manifest.toml"))
+
+    # Read legacy markdown manifest (PRIMARY source)
+    legacy = _parse_legacy_manifest(manifest_md)
+
+    # Read .env (SUPPLEMENTARY — connection name only)
+    env_vals: dict = {}
+    if env_path.exists():
+        with contextlib.suppress(Exception):
+            env_vals = dict(dotenv_values(env_path))
+
+    # Load or initialise manifest.toml
+    data = load_manifest(manifest_path)
+    ensure_manifest_defaults(data, manifest_path)
+
+    # ── Project metadata ──────────────────────────────────────────────────────
+    if legacy.get("project_name"):
+        data["project_name"] = legacy["project_name"]
+
+    # ── Snowflake connection (from .env only, manifest.md didn't store it) ────
+    conn = (
+        env_vals.get("SNOWFLAKE_DEFAULT_CONNECTION_NAME")
+        or data.get("snowflake", {}).get("connection")
+        or ""
+    )
+    if conn:
+        data["snowflake"]["connection"] = conn
+
+    # Populate other [snowflake] fields from .env supplementary
+    for env_key, sf_key in [
+        ("SNOWFLAKE_ACCOUNT",  "account"),
+        ("SNOWFLAKE_USER",     "user"),
+        ("SNOWFLAKE_ACCOUNT_URL", "account_url"),
+    ]:
+        val = env_vals.get(env_key, "")
+        if val and not data["snowflake"].get(sf_key):
+            data["snowflake"][sf_key] = val
+
+    # sf_utils_db from legacy manifest
+    sf_utils_db = (
+        legacy.get("sf_utils_db")
+        or env_vals.get("SF_UTILS_DB")
+        or env_vals.get("SNOW_UTILS_DB")
+        or data["snowflake"].get("sf_utils_db", "")
+    )
+    if sf_utils_db:
+        data["snowflake"]["sf_utils_db"] = sf_utils_db
+
+    # admin_role from legacy manifest
+    admin_role = (
+        legacy.get("admin_role")
+        or data["snowflake"].get("admin_role", "ACCOUNTADMIN")
+    )
+    data["snowflake"]["admin_role"] = admin_role
+
+    # ── prereqs — infra_ready ALWAYS false after migrate ─────────────────────
+    tools_verified = (
+        legacy.get("tools_verified")
+        or data.get("prereqs", {}).get("tools_verified", "")
+    )
+    data["prereqs"] = {
+        "tools_verified": tools_verified or datetime.date.today().isoformat(),
+        "infra_ready": False,
+    }
+
+    # ── Rule entry ────────────────────────────────────────────────────────────
+    rule_name = legacy.get("rule_name", "")
+    if rule_name:
+        label = rule_name.lower().replace("_", "-")
+
+        # Remove stale entries for the same rule_name under different labels
+        for _lbl in list(data.get("rule", {}).keys()):
+            if (
+                _lbl != label
+                and data["rule"][_lbl].get("rule_name", "").upper() == rule_name.upper()
+            ):
+                del data["rule"][_lbl]
+
+        status = legacy.get("status", "REMOVED")
+        _now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        rule_config: dict = {
+            "status":      status,
+            "created_at":  legacy.get("created_at", _now),
+            "updated_at":  _now,
+            "rule_name":   rule_name.upper(),
+            "rule_mode":   legacy.get("rule_mode", "INGRESS"),
+            "rule_type":   legacy.get("rule_type", "IPV4"),
+            "value_list":  [],
+            "policy_name": legacy.get("policy_name", ""),
+            "allow_github": False,
+            "allow_google": False,
+            "sf_utils_db": sf_utils_db.upper() if sf_utils_db else "",
+            "admin_role":  admin_role,
+        }
+        if legacy.get("resources"):
+            rule_config["resources"] = legacy["resources"]
+        if legacy.get("cleanup"):
+            rule_config["cleanup"] = legacy["cleanup"]
+
+        data.setdefault("rule", {})[label] = rule_config
+
+    if dry_run:
+        click.echo("# Dry-run — would write to manifest.toml:")
+        click.echo(f"  project_name: {data.get('project_name')}")
+        click.echo(f"  [snowflake].connection: {data.get('snowflake', {}).get('connection')}")
+        click.echo(f"  [snowflake].sf_utils_db: {data.get('snowflake', {}).get('sf_utils_db')}")
+        click.echo("  [prereqs].infra_ready: false")
+        if rule_name:
+            click.echo(f"  [rule.{label}].rule_name: {rule_name.upper()}")
+            click.echo(f"  [rule.{label}].status: {status}")
+        return
+
+    save_manifest(manifest_path, data)
+    click.echo(f"✓ Migrated to {manifest_path}")
+    if rule_name:
+        click.echo(f"  Rule entry: [rule.{label}] → {rule_name.upper()} ({status})")
+    click.echo("  [prereqs].infra_ready = false — run 'nw check-setup' to verify infra")
+
+    # Test connection; warn if it fails (don't block migration)
+    if conn:
+        _test = subprocess.run(
+            ["snow", "connection", "test", "-c", conn, "--format", "json"],
+            capture_output=True, text=True, check=False,
+        )
+        if _test.returncode != 0:
+            click.echo(
+                click.style(
+                    f"⚠ Connection '{conn}' test failed. "
+                    "Run 'nw setup-connection -c <name>' to set a working connection.",
+                    fg="yellow",
+                )
+            )
+        else:
+            click.echo(f"  connection '{conn}' verified ✓")
+    else:
+        click.echo(
+            click.style(
+                "⚠ No connection found. Run 'nw setup-connection -c <name>' to set one.",
+                fg="yellow",
+            )
+        )
 
 
 if __name__ == "__main__":

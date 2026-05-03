@@ -15,6 +15,48 @@ from functools import lru_cache
 import click
 import requests
 
+# Snowflake-managed GitHub Actions SaaS rule — always current, no manual refresh.
+# Add to a network policy's ALLOWED_NETWORK_RULE_LIST instead of inlining snapshot CIDRs.
+# Not available in gov regions.
+SNOWFLAKE_MANAGED_GITHUB_ACTIONS_RULE_FQN = (
+    "SNOWFLAKE.NETWORK_SECURITY.GITHUBACTIONS_GLOBAL"
+)
+
+# Intent Vocabulary for EGRESS HOST_PORT external access.
+# Named concepts bridging human language to HOST:PORT specs.
+# Only applicable when mode=EGRESS AND type=HOST_PORT.
+# Grounded in real production EAI usage (KAMESH_DEMOS.NETWORKS.*).
+EAI_HOST_PRESETS: dict[str, list[str]] = {
+    "slack":        ["*.slack.com:443"],
+    "github":       ["*.github.com:443"],
+    "google-apis":  ["www.googleapis.com:443", "oauth2.googleapis.com:443",
+                     "admin.googleapis.com:443", "accounts.google.com:443"],
+    "google-drive": ["drive.google.com:443", "www.googleapis.com:443",
+                     "oauth2.googleapis.com:443", "admin.googleapis.com:443",
+                     "accounts.google.com:443"],
+    "aws":          ["*.amazonaws.com:443", "*.amazon.com:443"],
+    "snowflake":    ["*.snowflakecomputing.com:443"],
+    "openai":       ["api.openai.com:443"],
+    "anthropic":    ["api.anthropic.com:443"],
+    "huggingface":  ["huggingface.co:443", "api-inference.huggingface.co:443"],
+    "pypi":         ["pypi.org:443", "files.pythonhosted.org:443"],
+    "sharepoint":   ["*.sharepoint.com:443", "graph.microsoft.com:443",
+                     "login.microsoftonline.com:443"],
+}
+EGRESS_PRESET_NAMES: list[str] = sorted(EAI_HOST_PRESETS)
+
+
+def collect_egress_hosts(
+    presets: list[str] | None = None,
+    custom_values: list[str] | None = None,
+) -> list[str]:
+    """Resolve intent vocabulary presets to concrete HOST:PORT strings. Deduplicates."""
+    hosts: list[str] = []
+    for name in (presets or []):
+        hosts.extend(EAI_HOST_PRESETS.get(name, []))
+    hosts.extend(custom_values or [])
+    return list(dict.fromkeys(hosts))
+
 
 def _validate_cidr(cidr: str) -> str:
     """Validate and normalise a CIDR string. Raises ClickException on bad input."""

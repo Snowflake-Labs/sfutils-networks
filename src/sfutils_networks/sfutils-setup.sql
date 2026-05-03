@@ -13,6 +13,8 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
+--!jinja
+
 -- =============================================================================
 -- sfutils Setup Script
 -- =============================================================================
@@ -41,7 +43,7 @@
 --   snow sql -f sfutils-setup.sql --enable-templating ALL --role <SA_ADMIN_ROLE>
 -- =============================================================================
 
-USE ROLE <% ctx.env.get('SA_ADMIN_ROLE', 'ACCOUNTADMIN') %>;
+USE ROLE <% ctx.env.SA_ADMIN_ROLE | default('ACCOUNTADMIN') %>;
 
 -- =============================================================================
 -- Step 1: Create Database and Schemas
