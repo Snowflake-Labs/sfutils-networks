@@ -58,7 +58,7 @@ from sfutils_networks._presets import (
 )
 
 MANIFEST_PATH = ".sfutils/manifest.toml"
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 # Ordered field lists drive the serializer — order is preserved in output.
 # Note: no "label" — the label is the TOML key, not a field inside the table.
@@ -75,6 +75,26 @@ _RULE_SCALAR_KEYS = [
     "allow_github",
     "allow_google",
     "sf_utils_db",
+    "admin_role",
+    "eai",
+    "policy",
+]
+
+_EAI_SCALAR_KEYS = [
+    "name",
+    "status",
+    "operation",
+    "created_at",
+    "updated_at",
+    "admin_role",
+]
+
+_POLICY_SCALAR_KEYS = [
+    "name",
+    "status",
+    "operation",
+    "created_at",
+    "updated_at",
     "admin_role",
 ]
 
@@ -192,6 +212,8 @@ def ensure_manifest_defaults(data: dict, manifest_path: Path | str = MANIFEST_PA
     if "prereqs" not in data:
         data["prereqs"] = {"tools_verified": _today_iso(), "infra_ready": False}
     data.setdefault("rule", {})
+    data.setdefault("eai", {})
+    data.setdefault("policy", {})
 
 
 def load_manifest(path: Path | str = MANIFEST_PATH) -> dict:
@@ -268,6 +290,42 @@ def save_manifest(path: Path | str, data: dict) -> None:
             for k, v in rule["cleanup"].items():
                 lines.append(f"{k:<20} = {_toml_value(v)}")
 
+    # [eai.<label>] named tables
+    for label, eai in data.get("eai", {}).items():
+        lines += ["", _section_comment(f"EAI: {label}")]
+        lines += [f"[eai.{label}]"]
+        emitted: set[str] = set()
+        for key in _EAI_SCALAR_KEYS:
+            if key in eai:
+                lines.append(f"{key:<20} = {_toml_value(eai[key])}")
+                emitted.add(key)
+        for key, val in eai.items():
+            if key not in emitted and not isinstance(val, dict):
+                lines.append(f"{key:<20} = {_toml_value(val)}")
+        # [eai.<label>.rules] subtable
+        if "rules" in eai:
+            lines += ["", f"[eai.{label}.rules]"]
+            for k, v in eai["rules"].items():
+                lines.append(f"{k:<30} = {_toml_value(v)}")
+
+    # [policy.<label>] named tables
+    for label, pol in data.get("policy", {}).items():
+        lines += ["", _section_comment(f"Policy: {label}")]
+        lines += [f"[policy.{label}]"]
+        emitted = set()
+        for key in _POLICY_SCALAR_KEYS:
+            if key in pol:
+                lines.append(f"{key:<20} = {_toml_value(pol[key])}")
+                emitted.add(key)
+        for key, val in pol.items():
+            if key not in emitted and not isinstance(val, dict):
+                lines.append(f"{key:<20} = {_toml_value(val)}")
+        # [policy.<label>.rules] subtable
+        if "rules" in pol:
+            lines += ["", f"[policy.{label}.rules]"]
+            for k, v in pol["rules"].items():
+                lines.append(f"{k:<30} = {_toml_value(v)}")
+
     content = "\n".join(lines) + "\n"
     p.write_text(content, encoding="utf-8")
     with contextlib.suppress(OSError):
@@ -311,6 +369,73 @@ def update_resource_status(data: dict, rule_name: str, status: str) -> None:
     now = _now_iso()
     for entry in data.get("rule", {}).values():
         if entry.get("rule_name", "").upper() == rule_name.upper():
+            entry["status"] = status
+            entry["updated_at"] = now
+            if status == "REMOVED":
+                entry["removed_at"] = now
+            return
+
+
+def upsert_eai(data: dict, label: str, eai_config: dict) -> None:
+    """Add or replace an EAI entry. Mutates data in place; caller calls save_manifest()."""
+    data.setdefault("eai", {})[label] = eai_config
+
+
+def upsert_policy_entry(data: dict, label: str, policy_config: dict) -> None:
+    """Add or replace a Policy entry. Mutates data in place; caller calls save_manifest()."""
+    data.setdefault("policy", {})[label] = policy_config
+
+
+def get_eai_entry(
+    data: dict,
+    *,
+    name: str | None = None,
+    label: str | None = None,
+) -> dict | None:
+    """Return EAI entry by label (O(1)) or by name (linear scan)."""
+    eais = data.get("eai", {})
+    if label:
+        return eais.get(label)
+    if name:
+        for entry in eais.values():
+            if entry.get("name", "").upper() == name.upper():
+                return entry
+    return None
+
+
+def get_eai_label_for_name(data: dict, name: str) -> str | None:
+    """Return the TOML label for an EAI with the given name, or None."""
+    for label, entry in data.get("eai", {}).items():
+        if entry.get("name", "").upper() == name.upper():
+            return label
+    return None
+
+
+def get_policy_label_for_name(data: dict, name: str) -> str | None:
+    """Return the TOML label for a policy with the given name, or None."""
+    for label, entry in data.get("policy", {}).items():
+        if entry.get("name", "").upper() == name.upper():
+            return label
+    return None
+
+
+def update_eai_status(data: dict, eai_name: str, status: str) -> None:
+    """Set status on the EAI entry matching eai_name. Mutates data in place."""
+    now = _now_iso()
+    for entry in data.get("eai", {}).values():
+        if entry.get("name", "").upper() == eai_name.upper():
+            entry["status"] = status
+            entry["updated_at"] = now
+            if status == "REMOVED":
+                entry["removed_at"] = now
+            return
+
+
+def update_policy_status(data: dict, policy_name: str, status: str) -> None:
+    """Set status on the policy entry matching policy_name. Mutates data in place."""
+    now = _now_iso()
+    for entry in data.get("policy", {}).values():
+        if entry.get("name", "").upper() == policy_name.upper():
             entry["status"] = status
             entry["updated_at"] = now
             if status == "REMOVED":
@@ -398,7 +523,123 @@ def validate_manifest(data: dict) -> list[str]:
         if not cleanup.get("db"):
             issues.append(f"{prefix} [cleanup].db is empty")
 
+    valid_operations = {"CREATED", "ALTERED"}
+
+    # [eai.*] entries
+    for label, eai in data.get("eai", {}).items():
+        prefix = f"[eai.{label}]"
+        for field in ("name", "status", "operation"):
+            if not eai.get(field):
+                issues.append(f"{prefix} missing required field: {field}")
+        if eai.get("operation") and eai["operation"] not in valid_operations:
+            issues.append(
+                f"{prefix} invalid operation '{eai['operation']}' "
+                f"(expected: {', '.join(sorted(valid_operations))})"
+            )
+        if eai.get("status") and eai["status"] not in valid_statuses:
+            issues.append(
+                f"{prefix} invalid status '{eai['status']}' "
+                f"(expected: {', '.join(sorted(valid_statuses))})"
+            )
+
+    # [policy.*] entries
+    for label, pol in data.get("policy", {}).items():
+        prefix = f"[policy.{label}]"
+        for field in ("name", "status", "operation"):
+            if not pol.get(field):
+                issues.append(f"{prefix} missing required field: {field}")
+        if pol.get("operation") and pol["operation"] not in valid_operations:
+            issues.append(
+                f"{prefix} invalid operation '{pol['operation']}' "
+                f"(expected: {', '.join(sorted(valid_operations))})"
+            )
+        if pol.get("status") and pol["status"] not in valid_statuses:
+            issues.append(
+                f"{prefix} invalid status '{pol['status']}' "
+                f"(expected: {', '.join(sorted(valid_statuses))})"
+            )
+
     return issues
+
+
+def migrate_v1_to_v2(data: dict) -> bool:
+    """Migrate schema v1 manifest to v2 in-place.
+
+    v1: EAI/policy info was in [rule.<label>.resources] and [rule.<label>.cleanup]
+    v2: Promotes EAI/policy to top-level [eai.*] and [policy.*] sections.
+
+    Returns True if migration was performed, False if already v2 or nothing to migrate.
+    """
+    if data.get("schema_version") == "2":
+        return False
+
+    now = _now_iso()
+    eai_seen: dict[str, str] = {}   # eai_name.upper() → label
+    policy_seen: dict[str, str] = {}  # policy_name.upper() → label
+
+    for rule_label, rule in data.get("rule", {}).items():
+        cleanup = rule.get("cleanup", {})
+        resources = rule.get("resources", {})
+
+        # Promote integration to [eai.*]
+        eai_name = (
+            resources.get("integration_name")
+            or cleanup.get("integration_name")
+        )
+        if eai_name and eai_name.upper() not in eai_seen:
+            eai_label = eai_name.lower().replace("_", "-")
+            eai_seen[eai_name.upper()] = eai_label
+            data.setdefault("eai", {})[eai_label] = {
+                "name":       eai_name.upper(),
+                "status":     rule.get("status", "COMPLETE"),
+                "operation":  "CREATED",
+                "created_at": rule.get("created_at", now),
+                "updated_at": rule.get("updated_at", now),
+                "admin_role": rule.get("admin_role", "ACCOUNTADMIN"),
+                "rules":      {rule_label: resources.get("network_rule", "")},
+            }
+        elif eai_name and eai_name.upper() in eai_seen:
+            # Add this rule to the existing EAI entry
+            eai_label = eai_seen[eai_name.upper()]
+            data["eai"][eai_label].setdefault("rules", {})[rule_label] = (
+                resources.get("network_rule", "")
+            )
+
+        # Promote policy to [policy.*]
+        policy_name = (
+            rule.get("policy_name")
+            or cleanup.get("policy_name")
+        )
+        if policy_name and policy_name.upper() not in policy_seen:
+            policy_label = policy_name.lower().replace("_", "-")
+            policy_seen[policy_name.upper()] = policy_label
+            data.setdefault("policy", {})[policy_label] = {
+                "name":       policy_name.upper(),
+                "status":     rule.get("status", "COMPLETE"),
+                "operation":  "CREATED",
+                "created_at": rule.get("created_at", now),
+                "updated_at": rule.get("updated_at", now),
+                "admin_role": rule.get("admin_role", "ACCOUNTADMIN"),
+                "rules":      {rule_label: resources.get("network_rule", "")},
+            }
+        elif policy_name and policy_name.upper() in policy_seen:
+            policy_label = policy_seen[policy_name.upper()]
+            data["policy"][policy_label].setdefault("rules", {})[rule_label] = (
+                resources.get("network_rule", "")
+            )
+
+        # Add back-references to the rule
+        if eai_name and eai_name.upper() in eai_seen:
+            rule["eai"] = eai_seen[eai_name.upper()]
+        if policy_name and policy_name.upper() in policy_seen:
+            rule["policy"] = policy_seen[policy_name.upper()]
+
+        # Simplify cleanup — remove integration_name and policy_name (now in parent sections)
+        for key in ("integration_name", "policy_name"):
+            cleanup.pop(key, None)
+
+    data["schema_version"] = "2"
+    return True
 
 
 # ---------------------------------------------------------------------------
