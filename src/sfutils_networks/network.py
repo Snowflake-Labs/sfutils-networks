@@ -1455,9 +1455,46 @@ def rule_delete_cmd(
 
     delete_network_rule(name.upper(), db.upper(), schema.upper(), admin_role=resolved_role)
 
-    # Write REMOVED after all drops succeed.
+    # Write REMOVED after all drops succeed — update rule, EAI, and policy statuses.
     _fin_data = load_manifest(manifest_path)
+    _fin_now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _rule_label = name.upper().lower().replace("_", "-")
+
+    # Mark rule REMOVED
     update_resource_status(_fin_data, name, "REMOVED")
+
+    # Mark EAI/policy in manifest to reflect what happened in Snowflake
+    if _eai_label and _eai_label in _fin_data.get("eai", {}):
+        _eai_sec = _fin_data["eai"][_eai_label]
+        if _eai_operation == "CREATED":
+            # EAI was dropped — mark REMOVED
+            _eai_sec["status"] = "REMOVED"
+            _eai_sec["removed_at"] = _fin_now
+        else:
+            # EAI still exists — remove our rule from [eai.*.rules] and update timestamp
+            _eai_sec.get("rules", {}).pop(_rule_label, None)
+            _eai_sec["updated_at"] = _fin_now
+            if not _eai_sec.get("rules"):
+                # No rules remain — signal the EAI is now empty
+                _eai_sec["status"] = "EMPTY"
+                click.echo(
+                    f"  ⚠  [eai.{_eai_label}] has no remaining rules in manifest.",
+                    err=True,
+                )
+
+    if _pol_label and _pol_label in _fin_data.get("policy", {}):
+        _pol_sec = _fin_data["policy"][_pol_label]
+        if _pol_operation == "CREATED":
+            # Policy was dropped — mark REMOVED
+            _pol_sec["status"] = "REMOVED"
+            _pol_sec["removed_at"] = _fin_now
+        else:
+            # Policy still exists — remove our rule from [policy.*.rules]
+            _pol_sec.get("rules", {}).pop(_rule_label, None)
+            _pol_sec["updated_at"] = _fin_now
+            if not _pol_sec.get("rules"):
+                _pol_sec["status"] = "EMPTY"
+
     save_manifest(manifest_path, _fin_data)
     click.echo(f"✓ Deleted: {fqn}")
 
