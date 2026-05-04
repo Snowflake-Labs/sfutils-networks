@@ -1467,33 +1467,34 @@ def rule_delete_cmd(
     if _eai_label and _eai_label in _fin_data.get("eai", {}):
         _eai_sec = _fin_data["eai"][_eai_label]
         if _eai_operation == "CREATED":
-            # EAI was dropped — mark REMOVED
+            # EAI was dropped — mark REMOVED and clear rules (audit trail is in [rule.*] + [eai.*])
             _eai_sec["status"] = "REMOVED"
             _eai_sec["removed_at"] = _fin_now
+            _eai_sec.get("rules", {}).clear()
         else:
             # EAI still exists — remove our rule from [eai.*.rules] and update timestamp
             _eai_sec.get("rules", {}).pop(_rule_label, None)
             _eai_sec["updated_at"] = _fin_now
             if not _eai_sec.get("rules"):
-                # No rules remain — signal the EAI is now empty
-                _eai_sec["status"] = "EMPTY"
-                click.echo(
-                    f"  ⚠  [eai.{_eai_label}] has no remaining rules in manifest.",
-                    err=True,
-                )
+                # No rules remain — our ALTERED relationship is complete; mark REMOVED
+                _eai_sec["status"] = "REMOVED"
+                _eai_sec["removed_at"] = _fin_now
 
     if _pol_label and _pol_label in _fin_data.get("policy", {}):
         _pol_sec = _fin_data["policy"][_pol_label]
         if _pol_operation == "CREATED":
-            # Policy was dropped — mark REMOVED
+            # Policy was dropped — mark REMOVED and clear rules (audit trail is in [rule.*] + [policy.*])
             _pol_sec["status"] = "REMOVED"
             _pol_sec["removed_at"] = _fin_now
+            _pol_sec.get("rules", {}).clear()
         else:
             # Policy still exists — remove our rule from [policy.*.rules]
             _pol_sec.get("rules", {}).pop(_rule_label, None)
             _pol_sec["updated_at"] = _fin_now
             if not _pol_sec.get("rules"):
-                _pol_sec["status"] = "EMPTY"
+                # No rules remain — our ALTERED relationship is complete; mark REMOVED
+                _pol_sec["status"] = "REMOVED"
+                _pol_sec["removed_at"] = _fin_now
 
     save_manifest(manifest_path, _fin_data)
     click.echo(f"✓ Deleted: {fqn}")
