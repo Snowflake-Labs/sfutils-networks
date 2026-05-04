@@ -52,8 +52,8 @@ from sfutils_networks._snow import (
 from sfutils_networks._toml_manifest import (
     ensure_manifest_defaults,
     get_eai_label_for_name,
+    get_policy_label_for_name,
     load_manifest,
-    migrate_v1_to_v2,
     resolve_rule_admin_role,
     resolve_rule_connection,
     save_manifest,
@@ -835,6 +835,7 @@ def cli(ctx: click.Context, verbose: bool, debug: bool, manifest_path: Path) -> 
       policy            - Manage network policies (create, list, delete)
       integration       - Manage External Access Integrations (EGRESS rules)
       list              - List all rules from manifest.toml
+      check-drift       - Compare manifest state against live Snowflake objects
       setup-connection  - Cache Snowflake connection in manifest.toml
       validate-manifest - Validate (and optionally repair) manifest.toml
       migrate           - Migrate legacy .env + manifest.md to manifest.toml
@@ -1122,7 +1123,10 @@ def rule_create(
             click.echo(f"  Presets: {', '.join(preset)}")
 
     if dry_run:
-        click.echo("SQL that would be executed:")
+        if integration_name:
+            click.echo("SQL that would be executed (rule + EAI):")
+        else:
+            click.echo("SQL that would be executed:")
         click.echo("─" * 60)
     elif output == "text" and not yes:
         if not click.confirm("\nProceed with network rule creation?", default=True):
@@ -1185,6 +1189,9 @@ def rule_create(
                 click.echo(f"✓ Updated EAI: {integration_upper}")
         else:
             click.echo(f"Creating EAI: {integration_upper}")
+            if dry_run:
+                click.echo("")
+                click.echo(f"-- 2. External Access Integration: {integration_upper}")
             create_external_access_integration(
                 integration_upper, [fqn], dry_run=dry_run, force=force, admin_role=resolved_role
             )
@@ -1197,29 +1204,31 @@ def rule_create(
     if not dry_run:
         _now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         _eai = integration_name.upper() if integration_name else ""
+        _pol = policy_name.upper() if policy_name else ""
         _rule_config: dict = {
             "status":      "COMPLETE",
             "created_at":  _now,
             "updated_at":  _now,
             "rule_name":   name.upper() if not github_only else "",
-            "rule_mode":   mode.upper(),
-            "rule_type":   rule_type.upper(),
+            "rule_mode":   mode_enum.value,    # Bug 1: use enum value, not CLI default string
+            "rule_type":   type_enum.value,    # Bug 1: use enum value, not CLI default string
             "value_list":  all_values,
-            "policy_name": policy_name.upper() if policy_name else "",
+            "policy_name": _pol,
             "allow_github": allow_gh,
             "allow_google": allow_google,
             "sf_utils_db": db.upper(),
             "admin_role":  resolved_role,
-            "eai":    integration_name.lower().replace("_", "-") if integration_name else "",
-            "policy": policy_name.lower().replace("_", "-") if policy_name else "",
+            "eai":    _eai,    # Bug 2: store name not slug; delete uses get_eai_label_for_name
+            "policy": _pol,    # Bug 2: store name not slug
             "resources": {
                 "network_rule":    fqn or "",
-                "network_policy":  policy_name.upper() if policy_name else "",
+                "network_policy":  _pol,
                 "integration_name": _eai,
             },
             "cleanup": {
-                "rule_name": name.upper() if not github_only else "",
-                "db":        db.upper(),
+                "rule_name":        name.upper() if not github_only else "",
+                "db":               db.upper(),
+                "integration_name": _eai,    # Bug 3: needed by delete v1 fallback path
             },
         }
         if not github_only:
@@ -1227,13 +1236,12 @@ def rule_create(
 
         # Write [policy.<label>] to manifest if policy was created/altered
         if policy_name:
-            _pol_upper = policy_name.upper()
-            _pol_label = _pol_upper.lower().replace("_", "-")
+            _pol_label = _pol.lower().replace("_", "-")
             _pol_operation = "ALTERED" if policy_mode.lower() == "alter" else "CREATED"
             _pol_data = load_manifest(manifest_path)
             _existing_pol = _pol_data.get("policy", {}).get(_pol_label, {})
             _pol_config = {
-                "name":       _pol_upper,
+                "name":       _pol,
                 "status":     "COMPLETE",
                 "operation":  _existing_pol.get("operation", _pol_operation),
                 "created_at": _existing_pol.get("created_at", _now),
@@ -1246,6 +1254,29 @@ def rule_create(
             _pol_config["rules"] = _pol_rules
             upsert_policy_entry(_pol_data, _pol_label, _pol_config)
             save_manifest(manifest_path, _pol_data)
+
+        # Bug 4 fix: Write [eai.<label>] to manifest if EAI was created/altered
+        # (rule_create previously wrote only [policy.*] but not [eai.*])
+        if integration_name and fqn:
+            _int_upper = integration_name.upper()
+            _int_op = "ALTERED" if integration_mode.lower() == "alter" else "CREATED"
+            _int_data = load_manifest(manifest_path)
+            _int_label = (
+                get_eai_label_for_name(_int_data, _int_upper)
+                or _int_upper.lower().replace("_", "-")
+            )
+            _existing_int = _int_data.get("eai", {}).get(_int_label, {})
+            _int_config = {
+                "name":       _int_upper,
+                "status":     "COMPLETE",
+                "operation":  _existing_int.get("operation", _int_op),
+                "created_at": _existing_int.get("created_at", _now),
+                "updated_at": _now,
+                "admin_role": resolved_role,
+                "rules":      {**_existing_int.get("rules", {}), label: fqn},
+            }
+            upsert_eai(_int_data, _int_label, _int_config)
+            save_manifest(manifest_path, _int_data)
 
 
 @rule.command(name="update")
@@ -1260,8 +1291,7 @@ def rule_create(
 )
 @click.option(
     "--allow-gh", "-G", is_flag=True,
-    help="NOTE: --allow-gh on update only affects VALUE_LIST (no snapshot). "
-         "To add GITHUBACTIONS_GLOBAL to a policy, use 'nw policy alter'.",
+    help="Not supported on update — raises an error. Use 'nw policy alter' instead.",
 )
 @click.option("--allow-google", "-g", is_flag=True, help="Include Google IPs (IPV4 only)")
 @click.option("--dry-run", is_flag=True, help="Preview SQL without executing")
@@ -1290,8 +1320,13 @@ def rule_update_cmd(
         network.py rule update --name my_rule --db my_db \
             --values "10.0.0.0/8,192.168.1.0/24" --no-local
     """
+    if allow_gh:
+        raise click.ClickException(
+            "--allow-gh is not supported on rule update. "
+            "To add SNOWFLAKE.NETWORK_SECURITY.GITHUBACTIONS_GLOBAL to a policy, use:\n"
+            "  nw policy alter --name <POLICY_NAME> --rules <DB.SCHEMA.RULE_FQN>"
+        )
     extra = [v.strip() for v in values.split(",")] if values else None
-    # --allow-gh is ignored for VALUE_LIST update (use 'nw policy alter' for managed rule)
     all_values = collect_ipv4_cidrs(allow_local, False, allow_google, extra)
 
     if not all_values:
@@ -1359,15 +1394,24 @@ def rule_delete_cmd(
     _rule_entry_v2 = _rule_entry
 
     # EAI cleanup: check parent [eai.*] section
-    _eai_label = (_rule_entry_v2 or {}).get("eai", "")
+    # rule["eai"] now stores uppercase name; resolve to label via scan
+    _eai_name_ref = (_rule_entry_v2 or {}).get("eai", "")
+    _eai_label = (
+        get_eai_label_for_name(_del_data, _eai_name_ref)
+        if _eai_name_ref else ""
+    ) or _eai_name_ref  # fallback: old manifests stored slug directly
     _eai_entry = _del_data.get("eai", {}).get(_eai_label, {}) if _eai_label else {}
-    _eai_name = _eai_entry.get("name", "")
+    _eai_name = _eai_entry.get("name", "") or _eai_name_ref
     _eai_operation = _eai_entry.get("operation", "CREATED")
 
     # Policy cleanup: check parent [policy.*] section
-    _pol_label = (_rule_entry_v2 or {}).get("policy", "")
+    _pol_name_ref = (_rule_entry_v2 or {}).get("policy", "")
+    _pol_label = (
+        get_policy_label_for_name(_del_data, _pol_name_ref)
+        if _pol_name_ref else ""
+    ) or _pol_name_ref
     _pol_entry = _del_data.get("policy", {}).get(_pol_label, {}) if _pol_label else {}
-    _pol_name = _pol_entry.get("name", "")
+    _pol_name = _pol_entry.get("name", "") or _pol_name_ref
     _pol_operation = _pol_entry.get("operation", "CREATED")
 
     # Also check v1 cleanup for backwards compat
@@ -1843,6 +1887,106 @@ def list_command(ctx: click.Context) -> None:
     click.echo()
 
 
+@cli.command(name="check-drift")
+@click.option(
+    "--admin-role", "-a", default=None,
+    help="Admin role for checking resources (default: from manifest)",
+)
+@click.pass_context
+def check_drift_command(ctx: click.Context, admin_role: str | None) -> None:
+    """Compare manifest.toml state against live Snowflake objects.
+
+    Reports resources marked COMPLETE in the manifest that no longer
+    exist in Snowflake (drift). Exits with code 1 if drift detected.
+
+    \b
+    Use in CI/CD to detect out-of-band changes:
+        nw check-drift || echo "Drift detected!"
+    """
+    manifest_path: Path = ctx.obj.get("manifest_path", Path(".sfutils/manifest.toml"))
+    data = load_manifest(manifest_path)
+    resolved_role = admin_role or resolve_rule_admin_role({}, data)
+
+    if not manifest_path.exists():
+        click.echo(f"No manifest found at {manifest_path}. Nothing to check.")
+        return
+
+    drift_found = False
+    checked = 0
+
+    def _check(label: str, exists: bool) -> None:
+        nonlocal drift_found, checked
+        checked += 1
+        if exists:
+            click.echo(f"  ✓ {label}")
+        else:
+            click.echo(click.style(f"  ✗ {label}  ← NOT FOUND in Snowflake", fg="red"))
+            drift_found = True
+
+    # Check rules
+    for rule_label, rule in data.get("rule", {}).items():
+        if rule.get("status") != "COMPLETE":
+            continue
+        rule_name = rule.get("rule_name", "")
+        db = rule.get("sf_utils_db", "")
+        if rule_name and db:
+            try:
+                result = run_snow_sql(
+                    f"DESC NETWORK RULE {db}.NETWORKS.{rule_name}",
+                    role=resolved_role,
+                    check=False,
+                )
+                _check(f"rule/{rule_label}  ({db}.NETWORKS.{rule_name})", result is not None)
+            except Exception:
+                _check(f"rule/{rule_label}  ({db}.NETWORKS.{rule_name})", False)
+
+    # Check EAIs
+    for eai_label, eai in data.get("eai", {}).items():
+        if eai.get("status") != "COMPLETE":
+            continue
+        eai_name = eai.get("name", "")
+        if eai_name:
+            try:
+                result = run_snow_sql(
+                    f"SHOW EXTERNAL ACCESS INTEGRATIONS LIKE '{eai_name}'",
+                    role=resolved_role,
+                    check=False,
+                )
+                _check(
+                    f"eai/{eai_label}  ({eai_name})",
+                    result is not None and len(result) > 0,
+                )
+            except Exception:
+                _check(f"eai/{eai_label}  ({eai_name})", False)
+
+    # Check policies
+    for pol_label, pol in data.get("policy", {}).items():
+        if pol.get("status") != "COMPLETE":
+            continue
+        pol_name = pol.get("name", "")
+        if pol_name:
+            try:
+                result = run_snow_sql(
+                    f"DESC NETWORK POLICY {pol_name}",
+                    role=resolved_role,
+                    check=False,
+                )
+                _check(f"policy/{pol_label}  ({pol_name})", result is not None)
+            except Exception:
+                _check(f"policy/{pol_label}  ({pol_name})", False)
+
+    if checked == 0:
+        click.echo("No COMPLETE resources in manifest to check.")
+        return
+
+    click.echo()
+    if drift_found:
+        click.echo(click.style(f"Drift detected ({checked} checked).", fg="red"), err=True)
+        raise SystemExit(1)
+    else:
+        click.echo(click.style(f"✓ No drift detected ({checked} checked).", fg="green"))
+
+
 @cli.command(name="validate-manifest")
 @click.option(
     "--fix",
@@ -1887,9 +2031,7 @@ def validate_manifest_command(ctx: click.Context, fix: bool) -> None:
     if fix:
         before = validate_manifest(data)
         ensure_manifest_defaults(data, manifest_path)
-        was_migrated = migrate_v1_to_v2(data)
-        if was_migrated:
-            click.echo("[manifest] Schema migrated: v1 → v2")
+        # promote_legacy_eai_policy_refs is called inside ensure_manifest_defaults
         save_manifest(manifest_path, data)
         after = validate_manifest(data)
         fixed_count = len(before) - len(after)
@@ -2271,10 +2413,8 @@ def migrate_command(
     click.echo("  [prereqs].infra_ready = false — run 'nw check-setup' to verify infra")
 
     # Migrate schema version
-    was_migrated = migrate_v1_to_v2(data)
-    if was_migrated:
-        save_manifest(manifest_path, data)
-        click.echo("  Schema: upgraded to v2 (EAI/Policy sections promoted)")
+    # ensure_manifest_defaults (called above) automatically promotes any legacy
+    # integration_name/policy_name refs to [eai.*]/[policy.*] sections.
 
     # Test connection; warn if it fails (don't block migration)
     if conn:

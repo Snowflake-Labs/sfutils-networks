@@ -58,7 +58,7 @@ from sfutils_networks._presets import (
 )
 
 MANIFEST_PATH = ".sfutils/manifest.toml"
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "1"
 
 # Ordered field lists drive the serializer — order is preserved in output.
 # Note: no "label" — the label is the TOML key, not a field inside the table.
@@ -214,6 +214,9 @@ def ensure_manifest_defaults(data: dict, manifest_path: Path | str = MANIFEST_PA
     data.setdefault("rule", {})
     data.setdefault("eai", {})
     data.setdefault("policy", {})
+    # Silently promote any legacy integration_name/policy_name from cleanup/resources
+    # to top-level [eai.*]/[policy.*] sections (additive, no version bump needed).
+    promote_legacy_eai_policy_refs(data)
 
 
 def load_manifest(path: Path | str = MANIFEST_PATH) -> dict:
@@ -562,15 +565,21 @@ def validate_manifest(data: dict) -> list[str]:
     return issues
 
 
-def migrate_v1_to_v2(data: dict) -> bool:
-    """Migrate schema v1 manifest to v2 in-place.
+def promote_legacy_eai_policy_refs(data: dict) -> bool:
+    """Promote legacy EAI/policy refs from rule cleanup/resources to top-level sections.
 
-    v1: EAI/policy info was in [rule.<label>.resources] and [rule.<label>.cleanup]
-    v2: Promotes EAI/policy to top-level [eai.*] and [policy.*] sections.
+    Old manifests stored integration_name and policy_name inside
+    [rule.<label>.resources] and [rule.<label>.cleanup]. This helper promotes
+    them to top-level [eai.*] and [policy.*] sections so the new hierarchical
+    layout is consistent.
 
-    Returns True if migration was performed, False if already v2 or nothing to migrate.
+    Called automatically by ensure_manifest_defaults() — no explicit migration step needed.
+    The schema_version stays "1" since the change is purely additive.
+
+    Returns True if any promotion was performed, False if nothing to promote.
     """
-    if data.get("schema_version") == "2":
+    if data.get("eai") or data.get("policy"):
+        # Already has top-level EAI/policy sections — nothing to promote
         return False
 
     now = _now_iso()
@@ -638,8 +647,7 @@ def migrate_v1_to_v2(data: dict) -> bool:
         for key in ("integration_name", "policy_name"):
             cleanup.pop(key, None)
 
-    data["schema_version"] = "2"
-    return True
+    return bool(eai_seen or policy_seen)
 
 
 # ---------------------------------------------------------------------------
