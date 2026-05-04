@@ -51,11 +51,15 @@ from sfutils_networks._snow import (
 )
 from sfutils_networks._toml_manifest import (
     ensure_manifest_defaults,
+    get_eai_label_for_name,
     load_manifest,
+    migrate_v1_to_v2,
     resolve_rule_admin_role,
     resolve_rule_connection,
     save_manifest,
     update_resource_status,
+    upsert_eai,
+    upsert_policy_entry,
     upsert_resource,
     validate_manifest,
 )
@@ -1206,20 +1210,42 @@ def rule_create(
             "allow_google": allow_google,
             "sf_utils_db": db.upper(),
             "admin_role":  resolved_role,
+            "eai":    integration_name.lower().replace("_", "-") if integration_name else "",
+            "policy": policy_name.lower().replace("_", "-") if policy_name else "",
             "resources": {
                 "network_rule":    fqn or "",
                 "network_policy":  policy_name.upper() if policy_name else "",
                 "integration_name": _eai,
             },
             "cleanup": {
-                "rule_name":       name.upper() if not github_only else "",
-                "policy_name":     policy_name.upper() if policy_name else "",
-                "integration_name": _eai,
-                "db":              db.upper(),
+                "rule_name": name.upper() if not github_only else "",
+                "db":        db.upper(),
             },
         }
         if not github_only:
             _persist_rule_state(manifest_path, label, _rule_config)
+
+        # Write [policy.<label>] to manifest if policy was created/altered
+        if policy_name:
+            _pol_upper = policy_name.upper()
+            _pol_label = _pol_upper.lower().replace("_", "-")
+            _pol_operation = "ALTERED" if policy_mode.lower() == "alter" else "CREATED"
+            _pol_data = load_manifest(manifest_path)
+            _existing_pol = _pol_data.get("policy", {}).get(_pol_label, {})
+            _pol_config = {
+                "name":       _pol_upper,
+                "status":     "COMPLETE",
+                "operation":  _existing_pol.get("operation", _pol_operation),
+                "created_at": _existing_pol.get("created_at", _now),
+                "updated_at": _now,
+                "admin_role": resolved_role,
+            }
+            _pol_rules = dict(_existing_pol.get("rules", {}))
+            if fqn:
+                _pol_rules[label] = fqn
+            _pol_config["rules"] = _pol_rules
+            upsert_policy_entry(_pol_data, _pol_label, _pol_config)
+            save_manifest(manifest_path, _pol_data)
 
 
 @rule.command(name="update")
@@ -1322,23 +1348,66 @@ def rule_delete_cmd(
     save_manifest(manifest_path, _del_data)
     click.echo(f"[manifest] '{name.upper()}' → DELETE_IN_PROGRESS", err=True)
 
-    # Look up associated policy from manifest for cleanup.
+    # Look up associated policy/EAI from manifest for cleanup.
     _rule_entry = None
     for _entry in _del_data.get("rule", {}).values():
         if _entry.get("rule_name", "").upper() == name.upper():
             _rule_entry = _entry
             break
-    _cleanup = (_rule_entry or {}).get("cleanup", {})
-    _policy_name = _cleanup.get("policy_name", "")
-    _eai_name = _cleanup.get("integration_name", "")
 
-    if _policy_name:
-        click.echo(f"Deleting associated policy: {_policy_name}")
-        delete_network_policy(_policy_name, admin_role=resolved_role)
+    # v2: look up parent EAI/policy from back-references on the rule
+    _rule_entry_v2 = _rule_entry
+
+    # EAI cleanup: check parent [eai.*] section
+    _eai_label = (_rule_entry_v2 or {}).get("eai", "")
+    _eai_entry = _del_data.get("eai", {}).get(_eai_label, {}) if _eai_label else {}
+    _eai_name = _eai_entry.get("name", "")
+    _eai_operation = _eai_entry.get("operation", "CREATED")
+
+    # Policy cleanup: check parent [policy.*] section
+    _pol_label = (_rule_entry_v2 or {}).get("policy", "")
+    _pol_entry = _del_data.get("policy", {}).get(_pol_label, {}) if _pol_label else {}
+    _pol_name = _pol_entry.get("name", "")
+    _pol_operation = _pol_entry.get("operation", "CREATED")
+
+    # Also check v1 cleanup for backwards compat
+    _cleanup_v1 = (_rule_entry_v2 or {}).get("cleanup", {})
+    if not _eai_name:
+        _eai_name = _cleanup_v1.get("integration_name", "")
+    if not _pol_name:
+        _pol_name = _cleanup_v1.get("policy_name", "")
+
+    # Drop policy first (dependency order), then EAI, then rule
+    if _pol_name:
+        if _pol_operation == "CREATED":
+            click.echo(f"Deleting associated policy: {_pol_name}")
+            delete_network_policy(_pol_name, admin_role=resolved_role)
+        else:  # ALTERED — just remove our rule from the policy
+            click.echo(f"Removing rule from policy: {_pol_name} (policy was ALTERED, not dropped)")
+            # ALTER NETWORK POLICY REMOVE ALLOWED_NETWORK_RULE_LIST = (fqn)
+            _rm_fqn = f"{db.upper()}.{schema.upper()}.{name.upper()}"
+            run_snow_sql_stdin(
+                f"USE ROLE {resolved_role};\n"
+                f"ALTER NETWORK POLICY IF EXISTS {_pol_name} "
+                f"REMOVE ALLOWED_NETWORK_RULE_LIST = ('{_rm_fqn}');"
+            )
 
     if _eai_name:
-        click.echo(f"Deleting associated EAI: {_eai_name}")
-        delete_external_access_integration(_eai_name, admin_role=resolved_role)
+        if _eai_operation == "CREATED":
+            click.echo(f"Deleting associated EAI: {_eai_name}")
+            delete_external_access_integration(_eai_name, admin_role=resolved_role)
+        else:  # ALTERED — just remove our rule from the EAI
+            click.echo(f"Removing rule from EAI: {_eai_name} (EAI was ALTERED, not dropped)")
+            _rm_fqn = f"{db.upper()}.{schema.upper()}.{name.upper()}"
+            _cur_rules = get_eai_current_rules(_eai_name, admin_role=resolved_role)
+            _new_rules = [r for r in _cur_rules if r.upper() != _rm_fqn.upper()]
+            if _new_rules:
+                run_snow_sql_stdin(
+                    f"USE ROLE {resolved_role};\n"
+                    + get_alter_external_access_integration_sql(_eai_name, _new_rules)
+                )
+            else:
+                click.echo(f"  (EAI {_eai_name} now has no rules — consider deleting it)")
 
     delete_network_rule(name.upper(), db.upper(), schema.upper(), admin_role=resolved_role)
 
@@ -1582,6 +1651,22 @@ def integration_create_cmd(
     if not dry_run:
         click.echo(f"✓ Created: {integration_upper}")
         click.echo(f"\n  Reference: EXTERNAL_ACCESS_INTEGRATIONS = ('{integration_upper}')")
+        # Write [eai.<label>] to manifest
+        _eai_label = integration_upper.lower().replace("_", "-")
+        _eai_now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _eai_data = load_manifest(manifest_path)
+        _eai_config = {
+            "name":       integration_upper,
+            "status":     "COMPLETE",
+            "operation":  "CREATED",
+            "created_at": _eai_now,
+            "updated_at": _eai_now,
+            "admin_role": resolved_role,
+            "rules":      {r.lower().replace("_", "-").replace(".", "-"): r for r in rule_fqns},
+        }
+        upsert_eai(_eai_data, _eai_label, _eai_config)
+        save_manifest(manifest_path, _eai_data)
+        click.echo(f"[manifest] EAI '{_eai_label}' → COMPLETE (CREATED)", err=True)
 
 
 @integration.command(name="alter")
@@ -1612,6 +1697,29 @@ def integration_alter_cmd(
     )
     if not dry_run:
         click.echo(f"✓ Updated: {integration_upper}")
+        # Write/update [eai.<label>] to manifest with operation=ALTERED
+        _eai_label = get_eai_label_for_name(load_manifest(manifest_path), integration_upper)
+        if _eai_label is None:
+            _eai_label = integration_upper.lower().replace("_", "-")
+        _eai_now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _eai_data = load_manifest(manifest_path)
+        _existing_eai = _eai_data.get("eai", {}).get(_eai_label, {})
+        _eai_config = {
+            "name":       integration_upper,
+            "status":     "COMPLETE",
+            "operation":  _existing_eai.get("operation", "ALTERED"),  # preserve CREATED
+            "created_at": _existing_eai.get("created_at", _eai_now),
+            "updated_at": _eai_now,
+            "admin_role": resolved_role,
+        }
+        # Merge new rules into existing rules dict
+        _eai_rules = dict(_existing_eai.get("rules", {}))
+        for r in rule_fqns:
+            _eai_rules[r.lower().replace("_", "-").replace(".", "-")] = r
+        _eai_config["rules"] = _eai_rules
+        upsert_eai(_eai_data, _eai_label, _eai_config)
+        save_manifest(manifest_path, _eai_data)
+        click.echo(f"[manifest] EAI '{_eai_label}' updated", err=True)
 
 
 @integration.command(name="list")
@@ -1659,32 +1767,79 @@ def integration_delete_cmd(
 @cli.command(name="list")
 @click.pass_context
 def list_command(ctx: click.Context) -> None:
-    """List all network rules recorded in manifest.toml."""
+    """List all network rules, EAIs, and policies recorded in manifest.toml."""
     manifest_path: Path = ctx.obj.get("manifest_path", Path(".sfutils/manifest.toml"))
     data = load_manifest(manifest_path)
     rules = data.get("rule", {})
+    eais = data.get("eai", {})
+    policies = data.get("policy", {})
 
-    if not rules:
+    if not rules and not eais and not policies:
         if not manifest_path.exists():
             click.echo(f"No manifest found at {manifest_path}. Run 'nw rule create' first.")
         else:
-            click.echo("No rule entries found in manifest.toml.")
+            click.echo("No entries found in manifest.toml.")
         return
 
-    click.echo(f"\n{'LABEL':<28} {'RULE_NAME':<40} {'MODE':<18} {'TYPE':<18} {'STATUS'}")
-    click.echo("─" * 115)
-    for label, rule in rules.items():
-        rule_name = rule.get("rule_name", "—")
-        mode = rule.get("rule_mode", "—")
-        rtype = rule.get("rule_type", "—")
-        status = rule.get("status", "—")
-        status_display = (
-            click.style(status, fg="green") if status == "COMPLETE"
-            else click.style(status, fg="yellow") if "IN_PROGRESS" in status
-            else click.style(status, fg="red") if status == "REMOVED"
-            else status
+    def _status_style(status: str) -> str:
+        if status == "COMPLETE":
+            return click.style(status, fg="green")
+        if "IN_PROGRESS" in status:
+            return click.style(status, fg="yellow")
+        if status == "REMOVED":
+            return click.style(status, fg="red")
+        return status
+
+    # EAI groups
+    for eai_label, eai in eais.items():
+        op = eai.get("operation", "")
+        click.echo(
+            f"\n  EAI: {click.style(eai.get('name', eai_label), bold=True)}"
+            f"  [{op}]  {_status_style(eai.get('status', '—'))}"
         )
-        click.echo(f"{label:<28} {rule_name:<40} {mode:<18} {rtype:<18} {status_display}")
+        click.echo(f"  {'─' * 60}")
+        for rule_label, _rule_fqn in eai.get("rules", {}).items():
+            rule = rules.get(rule_label, {})
+            mode = rule.get("rule_mode", "—")
+            rtype = rule.get("rule_type", "—")
+            vals = ", ".join(rule.get("value_list", []))
+            status = _status_style(rule.get("status", "—"))
+            click.echo(f"    {rule_label:<30} {mode:<12} {rtype:<10} {status}  {vals[:40]}")
+
+    # Policy groups
+    for pol_label, pol in policies.items():
+        op = pol.get("operation", "")
+        click.echo(
+            f"\n  POLICY: {click.style(pol.get('name', pol_label), bold=True)}"
+            f"  [{op}]  {_status_style(pol.get('status', '—'))}"
+        )
+        click.echo(f"  {'─' * 60}")
+        for rule_label, _rule_fqn in pol.get("rules", {}).items():
+            rule = rules.get(rule_label, {})
+            mode = rule.get("rule_mode", "—")
+            rtype = rule.get("rule_type", "—")
+            vals = ", ".join(rule.get("value_list", []))
+            status = _status_style(rule.get("status", "—"))
+            click.echo(f"    {rule_label:<30} {mode:<12} {rtype:<10} {status}  {vals[:40]}")
+
+    # Standalone rules (no eai or policy back-reference)
+    grouped_labels: set[str] = set()
+    for eai in eais.values():
+        grouped_labels.update(eai.get("rules", {}).keys())
+    for pol in policies.values():
+        grouped_labels.update(pol.get("rules", {}).keys())
+
+    standalone = {k: v for k, v in rules.items() if k not in grouped_labels}
+    if standalone:
+        click.echo("\n  STANDALONE RULES:")
+        click.echo(f"  {'─' * 60}")
+        click.echo(f"  {'LABEL':<30} {'MODE':<12} {'TYPE':<10} {'STATUS':<12} VALUES")
+        for label, rule in standalone.items():
+            mode = rule.get("rule_mode", "—")
+            rtype = rule.get("rule_type", "—")
+            vals = ", ".join(rule.get("value_list", []))
+            status = _status_style(rule.get("status", "—"))
+            click.echo(f"  {label:<30} {mode:<12} {rtype:<10} {status}  {vals[:40]}")
     click.echo()
 
 
@@ -1732,6 +1887,9 @@ def validate_manifest_command(ctx: click.Context, fix: bool) -> None:
     if fix:
         before = validate_manifest(data)
         ensure_manifest_defaults(data, manifest_path)
+        was_migrated = migrate_v1_to_v2(data)
+        if was_migrated:
+            click.echo("[manifest] Schema migrated: v1 → v2")
         save_manifest(manifest_path, data)
         after = validate_manifest(data)
         fixed_count = len(before) - len(after)
@@ -2111,6 +2269,12 @@ def migrate_command(
     if rule_name:
         click.echo(f"  Rule entry: [rule.{label}] → {rule_name.upper()} ({status})")
     click.echo("  [prereqs].infra_ready = false — run 'nw check-setup' to verify infra")
+
+    # Migrate schema version
+    was_migrated = migrate_v1_to_v2(data)
+    if was_migrated:
+        save_manifest(manifest_path, data)
+        click.echo("  Schema: upgraded to v2 (EAI/Policy sections promoted)")
 
     # Test connection; warn if it fails (don't block migration)
     if conn:
