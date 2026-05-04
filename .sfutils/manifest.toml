@@ -1,0 +1,42 @@
+# Machine-managed by Cortex Code. Do not hand-edit.
+schema_version = "1"
+project_name   = "sfutils-networks"
+created_at     = "2026-05-03T13:28:55Z"
+
+# ── Shared Snowflake connection (captured once, reused by all rules) ─────────
+[snowflake]
+connection           = ""
+sf_utils_db          = ""
+admin_role           = "ACCOUNTADMIN"
+
+# ── Tool / infra pre-flight cache ────────────────────────────────────────────
+[prereqs]
+tools_verified       = "2026-05-03"
+infra_ready          = false
+
+# ── Rule: my-rule ────────────────────────────────────────────────────────────
+[rule.my-rule]
+status               = "REMOVED"
+created_at           = "2026-05-04T03:06:36Z"
+updated_at           = "2026-05-04T03:06:36Z"
+removed_at           = "2026-05-04T03:06:36Z"
+rule_name            = "MY_RULE"
+rule_mode            = "INGRESS"
+rule_type            = "IPV4"
+value_list           = ["1.2.3.4/32"]
+policy_name          = ""
+allow_github         = false
+allow_google         = false
+sf_utils_db          = "MY_DB"
+admin_role           = "ACCOUNTADMIN"
+
+[rule.my-rule.resources]
+network_rule         = "MY_DB.NETWORKS.MY_RULE"
+network_policy       = ""
+integration_name     = ""
+
+[rule.my-rule.cleanup]
+rule_name            = "MY_RULE"
+policy_name          = ""
+integration_name     = ""
+db                   = "MY_DB"

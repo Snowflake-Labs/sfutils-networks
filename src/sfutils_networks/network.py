@@ -33,12 +33,13 @@ import click
 from dotenv import dotenv_values
 
 from sfutils_networks._presets import (
-    EGRESS_PRESET_NAMES,
+    PRESET_NAMES,
+    PRESET_REGISTRY,
     SNOWFLAKE_MANAGED_GITHUB_ACTIONS_RULE_FQN,
     NetworkRuleMode,
     NetworkRuleType,
-    collect_egress_hosts,
     collect_ipv4_cidrs,
+    collect_preset_values,
     get_valid_types_for_mode,
     validate_mode_type,
 )
@@ -932,8 +933,8 @@ def policy() -> None:
 @click.option(
     "--preset",
     multiple=True,
-    type=click.Choice(EGRESS_PRESET_NAMES, case_sensitive=False),
-    help="Intent vocabulary preset for HOST_PORT rules (repeatable: --preset slack --preset aws)",
+    type=click.Choice(PRESET_NAMES, case_sensitive=False),
+    help="Intent vocabulary preset — auto-derives mode/type and resolves to values (repeatable)",
 )
 @click.option("--dry-run", is_flag=True, help="Preview SQL without executing")
 @click.option(
@@ -1027,26 +1028,59 @@ def rule_create(
     mode_enum = NetworkRuleMode(mode.upper())
     type_enum = NetworkRuleType(rule_type.upper())
 
+    # When --preset is used, derive mode/type from the registry metadata.
+    # This is schema-driven: EGRESS presets → EGRESS/HOST_PORT automatically.
+    # Future INGRESS presets would resolve to INGRESS/IPV4 the same way.
+    # --integration is orthogonal and does not affect this derivation.
+    if preset:
+        _specs = [PRESET_REGISTRY[p] for p in preset]
+        _preset_modes = {s.mode for s in _specs}
+        _preset_types = {s.rule_type for s in _specs}
+        if len(_preset_modes) > 1 or len(_preset_types) > 1:
+            raise click.ClickException(
+                "Cannot mix presets with different modes/types in one rule. "
+                f"Modes found: {_preset_modes}. Types found: {_preset_types}."
+            )
+        mode_enum = NetworkRuleMode(_specs[0].mode)
+        type_enum = NetworkRuleType(_specs[0].rule_type)
+
     manifest_path: Path = ctx.obj.get("manifest_path", Path(".sfutils/manifest.toml"))
     _mdata = load_manifest(manifest_path)
     label = name.upper().lower().replace("_", "-")
     resolved_role = resolve_rule_admin_role({}, _mdata)
 
+    # Auto-disable allow_local for non-IPV4 rules (defaults to True but is IPV4-only).
+    # This prevents the default silently colliding when --type host_port or --preset is used.
+    if type_enum != NetworkRuleType.IPV4:
+        allow_local = False
+
     has_presets = allow_local or allow_gh or allow_google
     if has_presets and type_enum != NetworkRuleType.IPV4:
         raise click.ClickException(
-            f"IPv4 presets (--with-local, --allow-gh, --allow-google) "
+            f"IPv4 presets (--allow-gh, --allow-google) "
             f"only valid for --type ipv4, not {rule_type}"
         )
+
+    # --integration is EGRESS HOST_PORT only; IPV4 ingress flags are incompatible.
+    # This guard runs after allow_local has been coerced off, so only allow_gh
+    # and allow_google can trigger it here.
+    if integration_name:
+        ingress_flags_set = [
+            f for f, v in [("--allow-gh", allow_gh), ("--allow-google", allow_google)] if v
+        ]
+        if ingress_flags_set:
+            raise click.ClickException(
+                f"IPv4 ingress flags ({', '.join(ingress_flags_set)}) cannot be used with "
+                "--integration. EAI rules use EGRESS HOST_PORT, not IPv4."
+            )
 
     if type_enum == NetworkRuleType.IPV4:
         extra = [v.strip() for v in values.split(",")] if values else None
         # --allow-gh uses the Snowflake-managed SaaS rule, not snapshot CIDRs
         all_values = collect_ipv4_cidrs(allow_local, False, allow_google, extra)
     elif preset:
-        preset_hosts = collect_egress_hosts(list(preset))
         custom_hosts = [v.strip() for v in values.split(",")] if values else []
-        all_values = list(dict.fromkeys(preset_hosts + custom_hosts))
+        all_values = collect_preset_values(list(preset), custom_hosts)
     elif values:
         all_values = [v.strip() for v in values.split(",")]
     else:
@@ -1073,7 +1107,7 @@ def rule_create(
         )
     else:
         click.echo(
-            f"Creating {mode.upper()} network rule ({rule_type.upper()}) "
+            f"Creating {mode_enum.value} network rule ({type_enum.value}) "
             f"with {len(all_values)} value(s)..."
         )
         if allow_gh:
@@ -1708,14 +1742,23 @@ def validate_manifest_command(ctx: click.Context, fix: bool) -> None:
     issues = validate_manifest(data)
 
     if issues:
+        if fix:
+            # Structural repair succeeded; remaining gaps are configuration next-steps,
+            # not failures. Emit as informational guidance and exit 0.
+            click.echo(f"\n  {len(issues)} next step(s) needed to complete setup:")
+            for issue in issues:
+                click.echo(f"   → {issue}")
+            click.echo(
+                "\n  Run 'nw setup-connection -c <name>' then 'nw check-setup' to continue."
+            )
+            return  # exit 0
         click.echo(f"✗ manifest.toml validation failed ({len(issues)} issue(s)):", err=True)
         for issue in issues:
             click.echo(f"  ✗ {issue}", err=True)
-        if not fix:
-            click.echo(
-                "  Tip: run 'nw validate-manifest --fix' to repair structural gaps",
-                err=True,
-            )
+        click.echo(
+            "  Tip: run 'nw validate-manifest --fix' to repair structural gaps",
+            err=True,
+        )
         raise click.ClickException("Fix the issues above and re-run.")
 
     rule_count = len(data.get("rule", {}))

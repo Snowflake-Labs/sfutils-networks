@@ -63,13 +63,29 @@ class TestRuleCreate:
 
     def test_invalid_mode_type_combo_errors(self):
         runner = CliRunner()
-        # allow_local=True (default) with --type host_port triggers the preset guard
+        # --allow-gh (explicitly set IPv4 preset) with --type host_port triggers the guard
+        result = runner.invoke(
+            cli,
+            ["rule", "create", "--name", "MY_RULE", "--db", "MY_DB",
+             "--type", "host_port", "--allow-gh", "--policy", "P"],
+        )
+        assert result.exit_code == 1
+        assert "ipv4" in result.output.lower() or "invalid" in result.output.lower()
+
+    def test_allow_local_auto_coerced_for_host_port(self):
+        """--allow-local default (True) is silently coerced off for HOST_PORT rules."""
+        runner = CliRunner()
+        # With auto-coerce: --type host_port no longer errors on the preset guard;
+        # instead it hits "No values specified" (correct behaviour for no-value HOST_PORT)
         result = runner.invoke(
             cli,
             ["rule", "create", "--name", "MY_RULE", "--db", "MY_DB", "--type", "host_port"],
         )
         assert result.exit_code == 1
-        assert "ipv4" in result.output.lower() or "invalid" in result.output.lower()
+        # Must NOT error with "ipv4 presets" message — that would mean coerce failed
+        assert "ipv4 presets" not in result.output.lower()
+        # Must error with "no values" since no --preset or --values provided
+        assert "no values" in result.output.lower() or "values" in result.output.lower()
 
     def test_no_values_raises(self):
         runner = CliRunner()
@@ -80,6 +96,21 @@ class TestRuleCreate:
         )
         assert result.exit_code == 1
         assert "No values" in result.output
+
+    def test_preset_auto_derives_egress_host_port(self):
+        """--preset alone auto-sets mode=EGRESS and type=HOST_PORT from PRESET_REGISTRY."""
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["rule", "create", "--name", "SLACK_RULE", "--db", "MY_DB",
+             "--preset", "slack", "--dry-run"],
+        )
+        assert result.exit_code == 0, result.output
+        assert "EGRESS" in result.output
+        assert "HOST_PORT" in result.output
+        assert "*.slack.com:443" in result.output
+        # Confirm local IP is NOT included (auto-coerced off for HOST_PORT)
+        assert "allow_local" not in result.output.lower() or "192." not in result.output
 
 
 # ---------------------------------------------------------------------------
