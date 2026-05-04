@@ -4,6 +4,7 @@ IPv4 preset providers and network rule enums for Snowflake.
 Provides:
 - NetworkRuleMode and NetworkRuleType enums
 - Mode/type validation
+- Preset Registry: typed intent vocabulary mapping name → (mode, rule_type, values)
 - IPv4 preset fetchers (GitHub Actions, Google App Scripts, local IP)
 - CIDR collection utility
 """
@@ -11,6 +12,7 @@ Provides:
 import ipaddress
 from enum import StrEnum
 from functools import lru_cache
+from typing import NamedTuple
 
 import click
 import requests
@@ -22,40 +24,91 @@ SNOWFLAKE_MANAGED_GITHUB_ACTIONS_RULE_FQN = (
     "SNOWFLAKE.NETWORK_SECURITY.GITHUBACTIONS_GLOBAL"
 )
 
-# Intent Vocabulary for EGRESS HOST_PORT external access.
-# Named concepts bridging human language to HOST:PORT specs.
-# Only applicable when mode=EGRESS AND type=HOST_PORT.
+
+class PresetSpec(NamedTuple):
+    """Typed preset entry — carries mode/rule_type so auto-derivation is schema-driven.
+
+    Current entries are all EGRESS/HOST_PORT (for EAI Builder workflows).
+    Future INGRESS presets (e.g. corporate IP ranges) can be added with
+    mode="INGRESS" and rule_type="IPV4".
+    """
+
+    mode: str        # NetworkRuleMode value string, e.g. "EGRESS" or "INGRESS"
+    rule_type: str   # NetworkRuleType value string, e.g. "HOST_PORT" or "IPV4"
+    values: list[str]
+    description: str = ""
+
+
+# Preset Registry — intent vocabulary mapping name → rule spec.
+# All current entries are EGRESS/HOST_PORT (for External Access Integrations).
 # Grounded in real production EAI usage (KAMESH_DEMOS.NETWORKS.*).
-EAI_HOST_PRESETS: dict[str, list[str]] = {
-    "slack":        ["*.slack.com:443"],
-    "github":       ["*.github.com:443"],
-    "google-apis":  ["www.googleapis.com:443", "oauth2.googleapis.com:443",
-                     "admin.googleapis.com:443", "accounts.google.com:443"],
-    "google-drive": ["drive.google.com:443", "www.googleapis.com:443",
-                     "oauth2.googleapis.com:443", "admin.googleapis.com:443",
-                     "accounts.google.com:443"],
-    "aws":          ["*.amazonaws.com:443", "*.amazon.com:443"],
-    "snowflake":    ["*.snowflakecomputing.com:443"],
-    "openai":       ["api.openai.com:443"],
-    "anthropic":    ["api.anthropic.com:443"],
-    "huggingface":  ["huggingface.co:443", "api-inference.huggingface.co:443"],
-    "pypi":         ["pypi.org:443", "files.pythonhosted.org:443"],
-    "sharepoint":   ["*.sharepoint.com:443", "graph.microsoft.com:443",
-                     "login.microsoftonline.com:443"],
+PRESET_REGISTRY: dict[str, PresetSpec] = {
+    "slack":        PresetSpec("EGRESS", "HOST_PORT", ["*.slack.com:443"],
+                               "Slack messaging and webhooks"),
+    "github":       PresetSpec("EGRESS", "HOST_PORT", ["*.github.com:443"],
+                               "GitHub API and git operations"),
+    "google-apis":  PresetSpec("EGRESS", "HOST_PORT", [
+                                   "www.googleapis.com:443", "oauth2.googleapis.com:443",
+                                   "admin.googleapis.com:443", "accounts.google.com:443",
+                               ], "Google APIs and OAuth"),
+    "google-drive": PresetSpec("EGRESS", "HOST_PORT", [
+                                   "drive.google.com:443", "www.googleapis.com:443",
+                                   "oauth2.googleapis.com:443", "admin.googleapis.com:443",
+                                   "accounts.google.com:443",
+                               ], "Google Drive files (includes OAuth endpoints)"),
+    "aws":          PresetSpec("EGRESS", "HOST_PORT",
+                               ["*.amazonaws.com:443", "*.amazon.com:443"],
+                               "AWS services (S3, Secrets Manager, STS, etc.)"),
+    "snowflake":    PresetSpec("EGRESS", "HOST_PORT",
+                               ["*.snowflakecomputing.com:443"],
+                               "Snowflake REST API"),
+    "openai":       PresetSpec("EGRESS", "HOST_PORT", ["api.openai.com:443"],
+                               "OpenAI / ChatGPT API"),
+    "anthropic":    PresetSpec("EGRESS", "HOST_PORT", ["api.anthropic.com:443"],
+                               "Anthropic / Claude API"),
+    "huggingface":  PresetSpec("EGRESS", "HOST_PORT", [
+                                   "huggingface.co:443",
+                                   "api-inference.huggingface.co:443",
+                               ], "HuggingFace models and inference"),
+    "pypi":         PresetSpec("EGRESS", "HOST_PORT", [
+                                   "pypi.org:443",
+                                   "files.pythonhosted.org:443",
+                               ], "PyPI package registry"),
+    "sharepoint":   PresetSpec("EGRESS", "HOST_PORT", [
+                                   "*.sharepoint.com:443",
+                                   "graph.microsoft.com:443",
+                                   "login.microsoftonline.com:443",
+                               ], "SharePoint / Microsoft 365"),
 }
-EGRESS_PRESET_NAMES: list[str] = sorted(EAI_HOST_PRESETS)
+
+PRESET_NAMES: list[str] = sorted(PRESET_REGISTRY)
+
+# Backwards-compatible aliases (deprecated — use PRESET_REGISTRY / PRESET_NAMES)
+EAI_HOST_PRESETS: dict[str, list[str]] = {
+    name: spec.values for name, spec in PRESET_REGISTRY.items()
+}
+EGRESS_PRESET_NAMES = PRESET_NAMES
 
 
+def collect_preset_values(
+    preset_names: list[str],
+    custom_values: list[str] | None = None,
+) -> list[str]:
+    """Resolve preset names to their concrete value strings. Deduplicates."""
+    values: list[str] = []
+    for name in preset_names:
+        values.extend(PRESET_REGISTRY[name].values)
+    values.extend(custom_values or [])
+    return list(dict.fromkeys(values))
+
+
+# Deprecated alias
 def collect_egress_hosts(
     presets: list[str] | None = None,
     custom_values: list[str] | None = None,
 ) -> list[str]:
-    """Resolve intent vocabulary presets to concrete HOST:PORT strings. Deduplicates."""
-    hosts: list[str] = []
-    for name in (presets or []):
-        hosts.extend(EAI_HOST_PRESETS.get(name, []))
-    hosts.extend(custom_values or [])
-    return list(dict.fromkeys(hosts))
+    """Deprecated — use collect_preset_values() instead."""
+    return collect_preset_values(presets or [], custom_values)
 
 
 def _validate_cidr(cidr: str) -> str:
