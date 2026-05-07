@@ -118,6 +118,9 @@ _ROOT_KEYS = [
     "created_at",
 ]
 
+# Sections that this serializer writes explicitly — everything else is passed through.
+_OWNED_SECTIONS = {"snowflake", "prereqs", "rule", "eai", "policy"}
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -328,6 +331,24 @@ def save_manifest(path: Path | str, data: dict) -> None:
             lines += ["", f"[policy.{label}.rules]"]
             for k, v in pol["rules"].items():
                 lines.append(f"{k:<30} = {_toml_value(v)}")
+
+    # Preserve sections not owned by sfutils-networks (e.g. [pat.*], [volume.*], [openflow])
+    for key, val in data.items():
+        if not isinstance(val, dict):
+            continue
+        if key in _OWNED_SECTIONS:
+            continue
+        # Dotted keys like "rule.label" are sub-tables already written above
+        if "." in key:
+            continue
+        lines += ["", _section_comment(f"{key} (preserved by sfutils-networks)"), f"[{key}]"]
+        for k, v in val.items():
+            if isinstance(v, dict):
+                lines += ["", f"[{key}.{k}]"]
+                for sk, sv in v.items():
+                    lines.append(f"{sk:<20} = {_toml_value(sv)}")
+            else:
+                lines.append(f"{k:<20} = {_toml_value(v)}")
 
     content = "\n".join(lines) + "\n"
     p.write_text(content, encoding="utf-8")
