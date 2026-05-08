@@ -1,6 +1,6 @@
 [project]
 name = "sfutils-networks"
-version = "0.2.1"
+version = "0.2.2"
 description = "Snowflake network rules and policies manager - sfutils CLI package"
 readme = "README.md"
 requires-python = ">=3.12"
